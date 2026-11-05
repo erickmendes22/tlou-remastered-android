@@ -25,6 +25,11 @@
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. GOW3_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
+static int tlou_memory_walk_once;
+static void configure_memory_walk(void) {
+    const char *env=getenv("TLOU_MEMORY_WALK_ONCE");
+    tlou_memory_walk_once=env && env[0]=='1' && env[1]==0;
+}
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
@@ -200,6 +205,7 @@ static void region_erase(size_t at, size_t n) {
 }
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
+    configure_memory_walk();
     if (region_count) return;
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
@@ -380,7 +386,7 @@ static int pool(void) {
     backing_base=view;
     return 0;
 }
-void runtime_memory_reserve(void) {}
+void runtime_memory_reserve(void) { configure_memory_walk(); }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     void *mapped = !reserved
         ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
@@ -1048,9 +1054,13 @@ void runtime_memory_copy_backing(uintptr_t address, void *dest, uint64_t size) {
     unsigned char *out=dest;
     { const void *fast=cached_backing(address,size); if (fast) { memcpy(dest,fast,size); return; } }
     read_lock();
-    { size_t first=vma_index(address); if (first<vma_count && vmas[first].start<=address) cache_region(first); }
+    size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address) cache_region(i);
     for (uintptr_t at=address, end=address+size; at<end;) {
-        size_t i=vma_index(at);
+        /* The table cannot change under this read lock, and at only advances. */
+        if (tlou_memory_walk_once) {
+            while (i<vma_count && vmas[i].end<=at) ++i;
+        } else { i=vma_index(at); }
         uintptr_t next=end;
         if (i<vma_count && vmas[i].start<=at) {
             next=vmas[i].end<end ? vmas[i].end : end;
@@ -1097,9 +1107,10 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
+    size_t first=vma_index(address);
+    if (first<vma_count && vmas[first].start<=address) cache_region(first);
     uint64_t length=0;
-    for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
+    for (size_t i=tlou_memory_walk_once ? first : vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
         length=vmas[i].end-address;
     }

@@ -28,6 +28,8 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/mapped_readback_plan.h"
+#include "video_core/buffer_cache/tlou_hot_srt_readback.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -51,6 +53,9 @@ extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTra
 #endif
 
 namespace VideoCore {
+
+// Counts stack snapshots without expensive timing or logging per readback.
+static std::atomic<u64> tlou_stack_mapped_reads{0};
 
 // gow3 21 Oct 2026 (GPU worker): GOW3_GPU_PROFILE segments for the cache's own GPU copies
 // (uploads of CPU-written guest memory, readbacks); the interrupted segment continues after
@@ -720,7 +725,21 @@ void BufferCache::RunGuestCopy(const Gow3Copy::Item& item) {
 // idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
 void BufferCache::SmallGuestCopy(const Gow3Copy::Item& item) {
     if (scheduler.IsRecordingDeferred() && !Gow3Toggle::Disabled(Gow3Toggle::PoolSmallCopies)) {
-        scheduler.RecordHostCopy([item] { item.run(item); });
+        // Experimental: avoid a virtual record command and a release-store
+        // for every stream buffer. Only consecutive host copies in the same
+        // unpublished Vulkan command chunk can be grouped. On any other
+        // command, record-data allocation, or submission the group ends.
+        // The guest's source bytes are copied at the SAME recorder position;
+        // no shader/readback coherency semantics are relaxed.
+        static const bool batch = [] {
+            const char* env = std::getenv("GOW3_TLOU_HOST_COPY_BATCH");
+            return env && env[0] == '1' && env[1] == 0;
+        }();
+        if (batch) {
+            scheduler.RecordHostCopyItem(item);
+        } else {
+            scheduler.RecordHostCopy([item] { item.run(item); });
+        }
         return;
     }
     Gow3Copy::QueueCopy(item);
@@ -1779,6 +1798,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
+        // Keep the original relaxed 512 KiB fault window. The SotC precise
+        // experiment is removed, alongside the incompatible Readback 2 mode.
         constexpr u64 WindowSize = 512_KB;
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
@@ -1845,14 +1866,111 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges) {
-    struct Pending {
-        const Buffer* arena;
-        VAddr address;
-        u64 size;
-        u64 offset;
-    };
-    std::vector<Pending> pending;
+u64 BufferCache::CopyMappedReadbackPieces(std::span<const DownloadPiece> pending,
+                                               u64 total_size_bytes, u64 max_bytes,
+                                               size_t primary_pieces, u64* hot_published) {
+    if (primary_pieces > pending.size() && hot_published) return 0;
+    const auto coherent = vk::MemoryPropertyFlagBits::eHostCoherent;
+    if (arena_host_mapped && scheduler.host_read_barrier &&
+        (instance.GetMemoryProperties().memoryTypes[arena_memory_type_index].propertyFlags & coherent) &&
+        total_size_bytes <= max_bytes) {
+        const u64 current_tick = scheduler.CurrentTick();
+        const auto plan = [&]() -> std::optional<MappedReadbackPlan> {
+            std::shared_lock lock{gpu_ranges_mutex};
+            return PlanMappedReadback(pending, total_size_bytes, current_tick,
+                [this](u64 address) -> ReadbackMapping {
+                    const auto it = resident_ranges.Find(address >> block_shift);
+                    if (it == resident_ranges.end() || !it->mapped ||
+                        (it->offset & ((u64{1} << block_shift) - 1))) return {};
+                    const u64 base = it->start << block_shift;
+                    const u64 end = it->end << block_shift;
+                    if (address < base || address >= end) return {};
+                    return {it->mapped + it->offset + (address - base), end - address};
+                }, [this](u64 page) {
+                    u64 tick = 0;
+                    if (const auto w = gpu_write_window_tick.find(page >> 8); w != gpu_write_window_tick.end())
+                        tick = w->second;
+                    if (const auto p = gpu_write_page_tick.find(page); p != gpu_write_page_tick.end())
+                        tick = std::max(tick, p->second);
+                    return tick;
+                }, max_bytes);
+        }(); // release the cache history lock before Wait can submit callbacks
+        if (plan) {
+            // Both paths wait for the exact same producer tick and call the same
+            // guest-byte merger. Only the temporary snapshot allocation differs.
+            const auto copy_and_publish = [&](std::span<u8> snapshot) -> bool {
+                if (!CopyMappedReadback(*plan, snapshot,
+                    [this](u64 tick) { scheduler.Wait(tick); })) return false;
+                // Strict late guard for speculative SRT pieces. The CPU can write
+                // while the thread waits for the GPU; only an actually requested
+                // range may use the ordinary guest-byte merger unconditionally.
+                // Hot data is never marked CPU-current unless the GPU range is
+                // STILL owned by the GPU and no CPU-modified page overlaps it.
+                for (size_t i = 0; i < pending.size(); ++i) {
+                    const auto& p = pending[i];
+                    const bool hot = hot_published && i >= primary_pieces;
+                    if (hot) {
+                        const bool cpu_modified = memory_tracker->IsRegionCpuModified(
+                            p.address, p.size);
+                        const bool pending_older = PendingReadbackTick(
+                            p.address, p.size, false) != 0;
+                        u64 covered = 0;
+                        {
+                            std::shared_lock lk{gpu_ranges_mutex};
+                            gpu_modified_ranges.ForEachInRange(p.address, p.size,
+                                [&](VAddr a, VAddr b) { covered += b - a; });
+                        }
+                        bool lazy = false;
+                        for (VAddr page = Common::AlignDown(p.address, LAZY_PAGE_SIZE);
+                             page < p.address + p.size; page += LAZY_PAGE_SIZE)
+                            lazy |= lazy_pages.contains(page);
+                        if (!TlouHotSrtReadback::PublishAllowed(
+                                cpu_modified, pending_older, lazy, covered == p.size))
+                            continue;
+                    }
+                    WriteBackGpuData(p.address, snapshot.data() + p.offset, p.size);
+                    if (hot) {
+                        // The GPU bytes have *actually* been published; only now
+                        // retire their dirty range. Skipped candidates remain dirty
+                        // and will be fetched normally if the game requests them.
+                        GpuRangesSubtract(p.address, p.size);
+                        for (VAddr page = Common::AlignDown(p.address, LAZY_PAGE_SIZE);
+                             page < p.address + p.size; page += LAZY_PAGE_SIZE) {
+                            bool still_gpu = false;
+                            {
+                                std::shared_lock lk{gpu_ranges_mutex};
+                                still_gpu = gpu_modified_ranges.Intersects(page, LAZY_PAGE_SIZE);
+                            }
+                            if (!still_gpu)
+                                memory_tracker->UnmarkRegionAsGpuModified(page, LAZY_PAGE_SIZE);
+                        }
+                        *hot_published += p.size;
+                    }
+                }
+                return true;
+            };
+            static const bool stack_small = [] {
+                const char* env = std::getenv("TLOU_STACK_MAPPED_READBACK");
+                return env && env[0] == '1' && env[1] == 0;
+            }();
+            if (SmallMappedSnapshotEligible(total_size_bytes, stack_small)) {
+                std::array<u8, MaxStackMappedReadbackBytes> snapshot{};
+                if (copy_and_publish(std::span<u8>{snapshot}.first(total_size_bytes))) {
+                    tlou_stack_mapped_reads.fetch_add(1, std::memory_order_relaxed);
+                    return plan->tick;
+                }
+            } else {
+                std::vector<u8> snapshot(total_size_bytes);
+                if (copy_and_publish(std::span<u8>{snapshot}))
+                    return plan->tick;
+            }
+        }
+    }
+    return 0;
+}
+
+void BufferCache::DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges, bool hot_srt) {
+    std::vector<DownloadPiece> pending;
     u64 total_size_bytes = 0;
     // Older asynchronous readbacks of these bytes go first (theirs is older data).
     u64 readback_tick = 0;
@@ -1880,6 +1998,315 @@ void BufferCache::DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges) 
     if (total_size_bytes == 0) {
         return;
     }
+    // Log 20: ~9400 synchronous downloads / 5 s, predominantly small SRT tables.
+    // Coherent mapped arenas already expose the source bytes after their writing
+    // submission's HOST_READ barrier. Avoid a second GPU copy and an unrelated
+    // current submission when the source's own submission is already queued.
+    static const bool mapped_reads = [] {
+        const char* env = std::getenv("TLOU_MAPPED_READBACKS");
+        return env && env[0] == '1';
+    }();
+    struct MappedStats {
+        u64 direct{}, bytes{}, no_submit{}, fallback{};
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+    };
+    static MappedStats mapped_stats;
+    const auto report = [] {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mapped_stats.at >= std::chrono::seconds(5)) {
+            std::printf("TLOU mapped readbacks (5 s): direct=%llu bytes=%llu no-extra-submit=%llu staging-fallback=%llu stack-small=%llu\n",
+                (unsigned long long)mapped_stats.direct, (unsigned long long)mapped_stats.bytes,
+                (unsigned long long)mapped_stats.no_submit, (unsigned long long)mapped_stats.fallback,
+                static_cast<unsigned long long>(tlou_stack_mapped_reads.exchange(0, std::memory_order_relaxed)));
+            mapped_stats = MappedStats{};
+        }
+    };
+    const auto finish_ranges = [&] {
+        for (const auto& [address, size] : ranges) {
+            if (!size) continue;
+            EraseLazyPages(address, size);
+            // Page-level GPU protection must survive when another dirty
+            // subrange of this page remains (e.g. a read-ahead candidate was
+            // rejected because the guest wrote to it while the GPU ran).
+            for (VAddr page = Common::AlignDown(address, LAZY_PAGE_SIZE);
+                 page < address + size; page += LAZY_PAGE_SIZE) {
+                bool still_gpu = false;
+                {
+                    std::shared_lock lk{gpu_ranges_mutex};
+                    still_gpu = gpu_modified_ranges.Intersects(page, LAZY_PAGE_SIZE);
+                }
+                if (!still_gpu) {
+                    memory_tracker->UnmarkRegionAsGpuModified(page, LAZY_PAGE_SIZE);
+                }
+            }
+        }
+    };
+    // TLOU hot SRT readbacks: the SRT walker has drained Stage B before calling
+    // here. A requested GPU->CPU wait can also publish *already GPU-written*
+    // small tables used in recent walks, provided their latest producer is no
+    // later than that of the required table. Unlike same-walker sibling
+    // batching (zero compatible groups), this exploits temporal locality
+    // between separate draws. Other readback sources keep their old path.
+    const size_t required_pieces = pending.size();
+    const u64 required_bytes = total_size_bytes;
+    u64 hot_published = 0, hot_candidates_added = 0;
+    // TLOU: a shader often reads several small GPU-produced SRT fields on
+    // the same 4 KiB page in succession. Waiting separately for each costs
+    // both a timeline query and a GPU->CPU serialization. Unlike the old
+    // history prefetch (unrelated tables on other pages), this copies only
+    // *currently GPU-modified* bytes on a page the game already requested.
+    // The mapped readback planner requires a known, completed producer tick;
+    // the existing late CPU-dirty/readback/lazy checks protect every extra
+    // piece. Failed read-ahead always retries the exact original request.
+    static const bool srt_page_ahead = [] {
+        const char* env = std::getenv("TLOU_SRT_PAGE_AHEAD");
+        // The synthetic replay reduces API calls, but not modeled blocking
+        // time, and adds work when fields are rewritten or never consumed.
+        // Keep this diagnostic candidate opt-in until actual CPU savings and
+        // device coverage justify enabling it. Do not override the launcher.
+        return env && env[0] == '1' && env[1] == 0;
+    }();
+    u64 page_candidates = 0;
+    static struct SrtPageStats {
+        u64 requests = 0, candidates = 0, published = 0, late_skipped = 0;
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+    } page_stats;
+    if (srt_page_ahead && mapped_reads && hot_srt && required_pieces &&
+        required_bytes <= MaxMappedReadbackBytes) {
+        ++page_stats.requests;
+        constexpr size_t MaxPagePieces = 16;
+        constexpr u64 MaxPageBytes = 4096;
+        boost::container::small_vector<VAddr, 4> visited_pages;
+        // GPU ranges in the requested subrange have already been removed
+        // by GpuRangesSubtract above; those still dirty on this page are
+        // exactly the additional candidates (no overlapping writes).
+        for (size_t i = 0; i < required_pieces && pending.size() < required_pieces + MaxPagePieces; ++i) {
+            const auto primary = pending[i]; // pending may reallocate
+            const VAddr page = Common::AlignDown(primary.address, LAZY_PAGE_SIZE);
+            if (primary.address + primary.size > page + LAZY_PAGE_SIZE ||
+                std::ranges::find(visited_pages, page) != visited_pages.end()) {
+                continue;
+            }
+            visited_pages.push_back(page);
+            if (page < primary.arena->cpu_addr ||
+                page + LAZY_PAGE_SIZE > primary.arena->cpu_addr + primary.arena->size_bytes ||
+                memory_tracker->IsRegionCpuModified(page, LAZY_PAGE_SIZE) ||
+                PendingReadbackTick(page, LAZY_PAGE_SIZE, false) ||
+                lazy_pages.contains(page)) {
+                continue;
+            }
+            // The page bitmap is only a coarse filter. The exact
+            // gpu_modified_ranges intervals below exclude the already
+            // fetched primary bytes and any CPU-owned subranges.
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 8> pieces;
+            memory_tracker->ForEachDownloadRange<false>(
+                page, LAZY_PAGE_SIZE, [&](VAddr range, u64 bytes) {
+                    gpu_modified_ranges.ForEachInRange(range, bytes,
+                        [&](VAddr lo, VAddr hi) {
+                            if (lo < hi && lo >= page && hi <= page + LAZY_PAGE_SIZE) {
+                                pieces.emplace_back(lo, hi);
+                            }
+                        });
+                });
+            u64 added = 0;
+            for (const auto& [lo, hi] : pieces) {
+                const u64 aligned = (hi - lo + 63) & ~u64(63);
+                if (pending.size() >= required_pieces + MaxPagePieces ||
+                    added + aligned > MaxPageBytes ||
+                    total_size_bytes + aligned > MaxMappedReadbackBytes) {
+                    break;
+                }
+                pending.push_back({primary.arena, lo, hi - lo, total_size_bytes});
+                total_size_bytes += aligned;
+                added += aligned;
+                page_candidates += hi - lo;
+            }
+        }
+        page_stats.candidates += page_candidates;
+    }
+    static const bool enable_hot_srt = [] {
+        const char* env = std::getenv("TLOU_SRT_HOT_READBACKS");
+        return env && env[0] == '1' && env[1] == 0;
+    }();
+    static struct HotHistory {
+        struct Entry { VAddr address{}; u64 bytes{}; std::chrono::steady_clock::time_point last{}; };
+        std::array<Entry, 64> entries{};
+        size_t next = 0;
+        u64 requested = 0, candidates = 0, published = 0, late_skips = 0;
+        std::chrono::steady_clock::time_point report_at = std::chrono::steady_clock::now();
+    } hot_history;
+    // The disjoint-page temporal-history scan cost CPU but did not reduce
+    // gpu-ticks waits on logs 22/23. Keep it only as an explicit fallback
+    // when same-page read-ahead is disabled for diagnostics.
+    if (mapped_reads && hot_srt && enable_hot_srt && !srt_page_ahead) {
+        ++hot_history.requested;
+        const auto now = std::chrono::steady_clock::now();
+        const u64 current = scheduler.CurrentTick();
+        const auto newest_writer = [&](VAddr address, u64 bytes) -> u64 {
+            if (!bytes) return 0;
+            std::shared_lock lk{gpu_ranges_mutex};
+            u64 latest = 0;
+            for (u64 page = address >> 12; page <= (address + bytes - 1) >> 12; ++page) {
+                u64 tick = 0;
+                if (const auto it = gpu_write_page_tick.find(page); it != gpu_write_page_tick.end())
+                    tick = it->second;
+                if (const auto it = gpu_write_window_tick.find(page >> 8);
+                    it != gpu_write_window_tick.end())
+                    tick = std::max(tick, it->second);
+                if (!tick) return 0;  // never prefetch an untracked producer
+                latest = std::max(latest, tick);
+            }
+            return latest;
+        };
+        u64 primary_tick = 0;
+        for (size_t i = 0; i < required_pieces; ++i) {
+            const auto& p = pending[i];
+            const u64 tick = newest_writer(p.address, p.size);
+            if (!tick) { primary_tick = 0; break; }
+            primary_tick = std::max(primary_tick, tick);
+        }
+        if (primary_tick && primary_tick < current) {
+            // Recent *requested* SRT ranges only. Resident-mapping and CPU-dirty
+            // checks must hold again after waiting, before publishing anything.
+            constexpr u64 HotBytesLimit = 8192;
+            constexpr size_t HotPiecesLimit = 16;
+            const Buffer* required_arena = pending.front().arena;
+            for (size_t k = 0; k < hot_history.entries.size() &&
+                               pending.size() - required_pieces < HotPiecesLimit; ++k) {
+                const auto& entry = hot_history.entries[
+                    (hot_history.next + hot_history.entries.size() - 1 - k) %
+                    hot_history.entries.size()];
+                if (!entry.address || !entry.bytes || entry.bytes > 512 ||
+                    now - entry.last > std::chrono::seconds(4))
+                    continue;
+                // Before touching page-manager locks or walking mappings, drop
+                // the overwhelmingly common clean/no-longer-GPU-written tables.
+                if (!IsRangeGpuWrittenShared(entry.address, entry.bytes))
+                    continue;
+                const u64 first = entry.address >> block_shift;
+                const u64 last = (entry.address + entry.bytes - 1) >> block_shift;
+                if (!resident_ranges.Contains(first, last + 1) ||
+                    GetArena(first, last) != required_arena ||
+                    memory_tracker->IsRegionCpuModified(entry.address, entry.bytes) ||
+                    PendingReadbackTick(entry.address, entry.bytes, false))
+                    continue;
+                bool lazy = false, overlaps = false;
+                for (VAddr page = Common::AlignDown(entry.address, LAZY_PAGE_SIZE);
+                     page < entry.address + entry.bytes; page += LAZY_PAGE_SIZE)
+                    lazy |= lazy_pages.contains(page);
+                for (const auto& p : pending) {
+                    // Keep speculative tables off the pages whose tracker state
+                    // the required SRT read will retire. Otherwise its old
+                    // finish_ranges() could clear the candidate page's GPU bit
+                    // even when the late CPU-write check rejected publication.
+                    overlaps |= !TlouHotSrtReadback::PagesDisjoint(
+                        entry.address, entry.bytes, p.address, p.size);
+                }
+                if (lazy || overlaps) continue;
+                const u64 candidate_tick = newest_writer(entry.address, entry.bytes);
+                if (!TlouHotSrtReadback::Eligible(candidate_tick, primary_tick, current,
+                                                 entry.bytes, HotBytesLimit -
+                                                 std::min(HotBytesLimit, total_size_bytes - required_bytes)))
+                    continue;
+                std::vector<DownloadPiece> pieces;
+                u64 bytes = 0;
+                memory_tracker->ForEachDownloadRange<false>(
+                    entry.address, entry.bytes, [&](u64 addr, u64 size) {
+                        // Match the main DownloadRanges lock order: the tracker
+                        // callback already holds a page lock. Late publication
+                        // rechecks under gpu_ranges_mutex after the GPU wait.
+                        gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
+                            if (end > start) {
+                                pieces.push_back({required_arena, start, end - start, 0});
+                                bytes += (end - start + 63) & ~u64(63);
+                            }
+                        });
+                    });
+                if (pieces.empty() || pieces.size() + pending.size() - required_pieces > HotPiecesLimit ||
+                    bytes > HotBytesLimit - std::min(HotBytesLimit, total_size_bytes - required_bytes) ||
+                    total_size_bytes + bytes > MaxMappedReadbackBytes)
+                    continue;
+                for (auto& p : pieces) {
+                    p.offset = total_size_bytes;
+                    total_size_bytes += (p.size + 63) & ~u64(63);
+                    pending.push_back(p);
+                    hot_candidates_added += p.size;
+                }
+            }
+        }
+        // Remember actual SRT requests (not speculative hits), even when no
+        // other candidate was safe during this particular producer tick.
+        for (const auto& [address, bytes] : ranges) {
+            if (!address || !bytes || bytes > 512) continue;
+            bool known = false;
+            for (auto& entry : hot_history.entries) {
+                if (entry.address == address && entry.bytes == bytes) {
+                    entry.last = now;
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                hot_history.entries[hot_history.next] = {address, bytes, now};
+                hot_history.next = (hot_history.next + 1) % hot_history.entries.size();
+            }
+        }
+    }
+    const u64 current_tick = scheduler.CurrentTick();
+    if (mapped_reads) {
+        u64 tick = CopyMappedReadbackPieces(pending, total_size_bytes, MaxMappedReadbackBytes,
+                                           required_pieces, &hot_published);
+        if (!tick && pending.size() > required_pieces) {
+            // A speculative candidate must never turn a normally direct readback
+            // into staging: discard all hot extras and retry the original.
+            pending.resize(required_pieces);
+            total_size_bytes = required_bytes;
+            tick = CopyMappedReadbackPieces(pending, total_size_bytes, MaxMappedReadbackBytes);
+        }
+        if (tick) {
+            finish_ranges();
+            ++mapped_stats.direct;
+            mapped_stats.bytes += required_bytes + hot_published;
+            mapped_stats.no_submit += tick < current_tick;
+            if (srt_page_ahead && hot_srt) {
+                page_stats.published += hot_published;
+                page_stats.late_skipped += page_candidates - hot_published;
+                if ((page_stats.requests & 1023) == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - page_stats.at >= std::chrono::seconds(5)) {
+                        std::printf("TLOU SRT same-page read-ahead (5 s): requests=%llu "
+                                    "candidate-bytes=%llu published-bytes=%llu "
+                                    "late-skipped-bytes=%llu\n",
+                            (unsigned long long)page_stats.requests,
+                            (unsigned long long)page_stats.candidates,
+                            (unsigned long long)page_stats.published,
+                            (unsigned long long)page_stats.late_skipped);
+                        page_stats = SrtPageStats{};
+                    }
+                }
+            }
+            hot_history.candidates += hot_candidates_added;
+            hot_history.published += srt_page_ahead ? 0 : hot_published;
+            hot_history.late_skips += hot_candidates_added -
+                                      (srt_page_ahead ? 0 : hot_published);
+            if (hot_srt && enable_hot_srt &&
+                std::chrono::steady_clock::now() - hot_history.report_at >= std::chrono::seconds(5)) {
+                hot_history.report_at = std::chrono::steady_clock::now();
+                std::printf("TLOU SRT temporal readbacks (5 s): requested=%llu candidate-bytes=%llu published-bytes=%llu late-skipped-bytes=%llu\n",
+                    (unsigned long long)hot_history.requested,
+                    (unsigned long long)hot_history.candidates,
+                    (unsigned long long)hot_history.published,
+                    (unsigned long long)hot_history.late_skips);
+                hot_history.requested = hot_history.candidates = hot_history.published =
+                    hot_history.late_skips = 0;
+            }
+            report();
+            return;
+        }
+    }
+    pending.resize(required_pieces);
+    total_size_bytes = required_bytes;
+    if (mapped_reads) { ++mapped_stats.fallback; report(); }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (size_t i = 0; i < pending.size();) {
         boost::container::small_vector<vk::BufferCopy, 16> copies;
@@ -1898,12 +2325,7 @@ void BufferCache::DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges) 
     for (const auto& p : pending) {
         WriteBackGpuData(p.address, download.mapped + p.offset, p.size);
     }
-    for (const auto& [address, size] : ranges) {
-        if (size != 0) {
-            EraseLazyPages(address, size);
-            memory_tracker->UnmarkRegionAsGpuModified(address, size);
-        }
-    }
+    finish_ranges();
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -1935,6 +2357,40 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         return;
     }
     ++gow3_downloads;
+    static const bool mapped_faults = [] {
+        const char* env = std::getenv("TLOU_MAPPED_FAULT_READBACKS");
+        return env && env[0] == '1';
+    }();
+    if (mapped_faults) {
+        // Fault windows may span 512 KiB. Bound scratch memory to 1 MiB,
+        // including all padded islands; leave selection and cleanup unchanged.
+        std::vector<DownloadPiece> pieces;
+        pieces.reserve(copies.size());
+        for (const auto& copy : copies)
+            pieces.push_back({arena, arena_base + copy.srcOffset, copy.size, copy.dstOffset});
+        const u64 current_tick = scheduler.CurrentTick();
+        const u64 tick = CopyMappedReadbackPieces(pieces, total_size_bytes, MaxMappedFaultReadbackBytes);
+        struct FaultStats { u64 direct{}, bytes{}, no_submit{}, fallback{}; };
+        static FaultStats counts;
+        if (tick) {
+            ++counts.direct; counts.bytes += total_size_bytes;
+            counts.no_submit += tick < current_tick;
+        } else ++counts.fallback;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(5)) {
+            std::printf("TLOU mapped fault readbacks (5 s): direct=%llu bytes=%llu no-extra-submit=%llu staging-fallback=%llu\n",
+                (unsigned long long)counts.direct, (unsigned long long)counts.bytes,
+                (unsigned long long)counts.no_submit, (unsigned long long)counts.fallback);
+            counts = {}; last = now;
+        }
+        if (tick) {
+            EraseLazyPages(device_addr, size);
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+            return;
+        }
+    }
+
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
@@ -5434,7 +5890,11 @@ void BufferCache::SynchronizeDmaBuffers() {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
+        for (u64 offset = 0; offset < size;) {
+            const u32 bytes = static_cast<u32>(std::min<u64>(size - offset, 1ULL << 30));
+            SynchronizeMemory(address_space[page], device_addr + offset, bytes, false, false);
+            offset += bytes;
+        }
     }
 }
 
@@ -5886,6 +6346,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     if (copies.empty()) {
         return nullptr;
     }
+    Gow3Stats::buffer_upload_batches.fetch_add(1, std::memory_order_relaxed);
     // Resolve before launching host copies: a copy-thread fault could deadlock submission.
     for (const auto& copy : copies) {
         texture_cache.ResolveReadbacks(copy.dstOffset, copy.size, true, ReadbackSource::BufferUpload);

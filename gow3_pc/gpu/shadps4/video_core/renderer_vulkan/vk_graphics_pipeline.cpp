@@ -94,6 +94,7 @@ GraphicsPipeline::GraphicsPipeline(
     const auto started = Clock::now();
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    RefreshTextureHelperEligibility();
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 

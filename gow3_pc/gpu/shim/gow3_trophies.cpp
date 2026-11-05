@@ -9,7 +9,9 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#ifndef __ANDROID__
 #include <SDL3/SDL.h>
+#endif
 #include "gow3_overlay.h"
 
 namespace Gow3Trophies {
@@ -84,6 +86,9 @@ std::vector<int> Ids() {
 // Two soft bell notes, our own sound, on the default output (the runtime opened SDL audio).
 // GOW3_TROPHY_SOUND=0: none.
 void Chime() {
+#ifdef __ANDROID__
+    return; // Android game audio is PCM/FIFO; never initialize SDL.
+#else
     static const bool enabled = [] {
         const char* env = std::getenv("GOW3_TROPHY_SOUND");
         return !(env && env[0] == '0');
@@ -122,6 +127,7 @@ void Chime() {
         }
     }
     SDL_PutAudioStreamData(stream, pcm.data(), int(pcm.size() * sizeof(float)));
+#endif
 }
 
 } // namespace

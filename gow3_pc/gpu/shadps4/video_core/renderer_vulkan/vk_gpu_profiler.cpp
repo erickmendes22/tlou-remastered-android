@@ -14,6 +14,17 @@ void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
     if (!env || env[0] != '1' || instance_ptr) {
         return;
     }
+    const auto physical = instance.GetPhysicalDevice();
+    const auto families = physical.getQueueFamilyProperties();
+    const auto feature_chain = physical.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                     vk::PhysicalDeviceVulkan12Features>();
+    if (instance.GetGraphicsQueueFamilyIndex() >= families.size() ||
+        families[instance.GetGraphicsQueueFamilyIndex()].timestampValidBits == 0 ||
+        !feature_chain.get<vk::PhysicalDeviceVulkan12Features>().hostQueryReset ||
+        physical.getProperties().limits.timestampPeriod <= 0.0f) {
+        std::printf("GPU profile: unavailable (timestamps/host query reset unsupported)\n");
+        return;
+    }
     instance_ptr = new GpuProfiler(instance, scheduler);
 }
 
@@ -26,6 +37,9 @@ GpuProfiler::GpuProfiler(const Instance& instance, Scheduler& scheduler_)
     pool = Check<"create timestamp query pool">(device.createQueryPoolUnique(info));
     device.resetQueryPool(*pool, 0, NumSlices * SliceQueries);
     period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+    const auto valid_bits = instance.GetPhysicalDevice().getQueueFamilyProperties()
+                                [instance.GetGraphicsQueueFamilyIndex()].timestampValidBits;
+    timestamp_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
     for (auto& k : keys) {
         k.reserve(SliceQueries);
     }
@@ -82,7 +96,7 @@ void GpuProfiler::Collect(u32 which) {
         return;
     }
     for (u32 i = 0; i + 1 < count; ++i) {
-        const double ms = double(stamps[i + 1] - stamps[i]) * period_ns / 1e6;
+        const double ms = double((stamps[i + 1] - stamps[i]) & timestamp_mask) * period_ns / 1e6;
         auto& total = totals[keys[which][i]];
         total.ms += ms;
         ++total.segments;

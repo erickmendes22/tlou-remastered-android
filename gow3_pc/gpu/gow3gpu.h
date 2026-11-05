@@ -39,6 +39,8 @@ void gow3gpu_trophy_list(const char *pack_path, int list, const uint32_t earned[
 void gow3gpu_trophy_earned(int id);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int gow3gpu_overlay_captures_input(void);
+// Bionic pad bridge publishes the PS4 button bitmask for in-app choice/dialog input.
+void gow3gpu_pad_publish(uint32_t buttons);
 /* Mouse movement since the last call (pixels) and held sources (bit 0 left, 1 middle, 2 right,
  * 3 X1, 4 X2, 5 wheel up, 6 wheel down); returns 1 while the mouse is captured (gow3_mouse.h). */
 int gow3gpu_mouse_take(float *dx, float *dy, unsigned *buttons);

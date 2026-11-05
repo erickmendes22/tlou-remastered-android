@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+  <application android:name="ro.cobrabm.fexdroid.TlouApplication" android:allowBackup="false" android:isGame="true"
+               android:label="The Last of Us Remastered Android"
+               android:usesCleartextTraffic="false"
+               android:extractNativeLibs="true"
+               android:theme="@android:style/Theme.Material.NoActionBar">
+    <activity android:name="ro.cobrabm.fexdroid.MainActivity"
+              android:exported="true"
+              android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+    <activity android:name="ro.cobrabm.fexdroid.GameActivity"
+              android:exported="false"
+              android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout" />
+  </application>
+</manifest>

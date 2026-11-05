@@ -38,6 +38,20 @@
 #define STBTT_STATIC
 #include "imstb_truetype.h"
 
+#ifdef __ANDROID__
+// The Android overlay is headless, but prompt-atlas generation still needs
+// the original DejaVu font. Embed the exact source asset once on ARM64.
+asm(".section .rodata\n"
+    ".balign 16\n"
+    ".hidden gow3_font_ttf\n"
+    ".global gow3_font_ttf\n"
+    "gow3_font_ttf:\n"
+    ".incbin \"" GOW3_FONT_PATH "\"\n"
+    ".hidden gow3_font_ttf_end\n"
+    ".global gow3_font_ttf_end\n"
+    "gow3_font_ttf_end:\n"
+    ".previous\n");
+#endif
 extern "C" const unsigned char gow3_font_ttf[]; // gow3_overlay.cpp: DejaVu Sans
 
 namespace Gow3Prompts {

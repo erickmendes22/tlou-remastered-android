@@ -1,0 +1,58 @@
+name: TLOU CPU correctness and measured cost
+
+on:
+  push:
+    branches: ['perf/pm4-checksum-validation', 'android-bionic-stage1']
+    paths:
+      - 'gow3_pc/gpu/shadps4/video_core/amdgpu/pm4_packet_checksum.h'
+      - 'gow3_pc/tests/test_pm4_checksum_cost.cpp'
+      - 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/tlou_cpu_phase_sample.h'
+      - 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp'
+      - 'gow3_pc/tests/test_cpu_phase_sample.cpp'
+      - '.github/workflows/tlou-pm4-cost.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checksum:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install benchmark dependency used by the runtime
+        run: sudo apt-get update -qq && sudo apt-get install -y libxxhash-dev
+      - name: Build and run the production checksum benchmark
+        run: |
+          set -euo pipefail
+          mkdir -p out/pm4-cost
+          uname -m | tee out/pm4-cost/architecture.txt
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            gow3_pc/tests/test_pm4_checksum_cost.cpp -lxxhash -o out/pm4-cost/checksum
+          out/pm4-cost/checksum | tee out/pm4-cost/result.txt
+          out/pm4-cost/checksum | tee out/pm4-cost/repeat.txt
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
+            gow3_pc/tests/test_cpu_phase_sample.cpp -o out/pm4-cost/sampler
+          out/pm4-cost/sampler | tee out/pm4-cost/sampler.txt
+          out/pm4-cost/sampler | tee out/pm4-cost/sampler-repeat.txt
+      - name: Check memory access and undefined behavior
+        run: |
+          set -euo pipefail
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            gow3_pc/tests/test_pm4_checksum_cost.cpp -lxxhash -o out/pm4-cost/checksum-asan
+          out/pm4-cost/checksum-asan --correctness-only
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Werror -pthread \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            gow3_pc/tests/test_cpu_phase_sample.cpp -o out/pm4-cost/sampler-asan
+          out/pm4-cost/sampler-asan --correctness-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pm4-cost-${{ matrix.runner }}
+          path: out/pm4-cost/*.txt
+          if-no-files-found: error

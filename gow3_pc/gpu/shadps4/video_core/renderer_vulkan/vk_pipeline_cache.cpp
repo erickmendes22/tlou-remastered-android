@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "shader_recompiler/backend/spirv/tlou_split_compute.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -622,7 +623,7 @@ void PipelineCache::PublishShaders(bool wait) {
             }
             continue;
         }
-        const auto perm_hash = HashCombine(hash, build->permutation);
+        const auto perm_hash = TlouComputeSplit::PermutationKey(hash, HashCombine(hash, build->permutation));
         Vulkan::SetObjectName(instance.GetDevice(), build->module,
                              GetShaderName(build->info.hw_stage, hash, build->permutation));
         RegisterShaderBinary(std::move(build->binary), hash, build->permutation);
@@ -630,6 +631,7 @@ void PipelineCache::PublishShaders(bool wait) {
             std::unique_lock lock{programs_mutex};
             if (build->initial) {
                 program->info = std::move(build->info);
+                program->compute_perm_memo.Invalidate();
                 // user_data is refreshed on the next lookup; no pointer into a completed job survives.
                 program->info.user_data = {};
                 program->info_template = std::make_unique<Shader::Info>(program->info);
@@ -932,7 +934,7 @@ void PipelineCache::RunPrecompile(PrecompiledCompute& job) {
     job.spirv = std::move(spv);
     job.program->AddPermut(module, std::move(*job.spec));
     job.spec.reset();
-    job.key.value = HashCombine(job.hash, 0);
+    job.key.value = TlouComputeSplit::PermutationKey(job.hash, HashCombine(job.hash, 0));
     job.pipeline = std::make_unique<ComputePipeline>(
         instance, scheduler, desc_heap, profile, *worker_pipeline_caches[AsyncCompiler::WorkerIndex()],
         job.key, job.program->info, module, job.sdata, false);
@@ -973,7 +975,7 @@ void PipelineCache::Adopt(PrecompiledCompute& job) {
         return;
     }
     auto& program = job.program;
-    const u64 perm_hash = HashCombine(job.hash, 0);
+    const u64 perm_hash = TlouComputeSplit::PermutationKey(job.hash, HashCombine(job.hash, 0));
     RegisterShaderBinary(std::move(job.spirv), job.hash, 0);
     // user_data pointed into the job's registers: refreshed by the next lookup.
     program->info.user_data = {};
@@ -1426,14 +1428,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return used(it->second->Failed() ? nullptr : it->second.get());
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
+const ComputePipeline* PipelineCache::GetComputePipeline(bool allow_split64) {
     PublishShaders();
     PublishGraphics();
     DrainPrefetch();
     PumpWarmUp();
     NoteWarmupOrder();
     AdoptPrecompiled();
-    if (!RefreshComputeKey()) {
+    if (!RefreshComputeKey(allow_split64)) {
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
@@ -1822,10 +1824,23 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     return true;
 }
 
-bool PipelineCache::RefreshComputeKey() {
+bool PipelineCache::RefreshComputeKey(bool allow_split64) {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    auto cs_params = AmdGpu::GetParams(cs_pgm);
+    if (TlouComputeSplit::Enabled() && TlouComputeSplit::IsTarget(cs_params.hash)) {
+        const std::array<u32, 3> local{cs_pgm.num_thread_x.full,
+            cs_pgm.num_thread_y.full, cs_pgm.num_thread_z.full};
+        const auto max_x = instance.GetPhysicalDevice().getProperties().limits.maxComputeWorkGroupCount[0];
+        if (!allow_split64 ||
+            !TlouComputeSplit::EligibleGeometry(cs_params.hash, local, cs_pgm.SharedMemSize(), false) ||
+            !TlouComputeSplit::CanExpandX(cs_pgm.dim_x, max_x)) {
+            // A cached native LocalSize=1024 module must never be used by a
+            // direct split64 dispatch, or vice versa. The fallback also
+            // leaves indirect dispatch argument buffers unchanged.
+            cs_params.hash = TlouComputeSplit::NativeFallbackHash(cs_params.hash);
+        }
+    }
     bool has_fetch = false;
     std::tie(sel.infos[0], sel.modules[0], has_fetch, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding, sel.fetch_shader);
@@ -1860,14 +1875,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
         DebugState.CollectShader(name, info.sw_stage, module, spv, code,
                                  patch ? *patch : std::span<const u32>{}, is_patched);
     }
+    // Debug collection consumes the SPIR-V before cache I/O takes ownership.
+    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
     return module;
 }
 
@@ -1885,11 +1900,66 @@ static bool AssignFetch(std::optional<Shader::Gcn::FetchShaderData>& to,
     return true;
 }
 
+// No part of the specialization for these compute descriptors may depend on
+// current VMA membership, which can change without changing flattened guest
+// data. Garbage-effect descriptors are deterministic; non-effect odd buffers
+// ask gpu_mapped_extent and must take the original path on every dispatch.
+// This is checked on memo creation, NOT on a memo hit.
+static bool ExactComputeMemoSafe(const Shader::Info& info) {
+    if (info.has_fetch_shader || info.FlatUserData().size() > 256) {
+        return false;
+    }
+    for (const auto& desc : info.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        AmdGpu::Buffer sharp{};
+        if (!desc.sharp_fetch.Fetch(info.FlatUserData().data(), &sharp)) {
+            continue;
+        }
+        if (desc.post_op == Shader::SharpFetchPostOp::BitwiseOrDw1WithImm) {
+            reinterpret_cast<u32*>(&sharp)[1] |= desc.post_op_dw1_mask;
+        } else if (desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase) {
+            sharp.base_address += info.ProgramBase();
+        }
+        if (!Shader::IsEffectShader(info.pgm_hash) && sharp.base_address &&
+            sharp.GetSize() != 0 && ((sharp.base_address & 3) != 0 ||
+                sharp.stride >= 8192 || sharp.GetSize() > 64_MB)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
                                                 std::optional<Shader::Gcn::FetchShaderData>& fetch) {
+    // Profile-only, bounded evidence for the two expensive compute programs.
+    // Capture before the cache lookup so an already cached program is included.
+    if (hw_stage == HwStage::Compute && (params.hash == 0x22e6e19e || params.hash == 0x61d67259)) {
+        static const bool capture = [] {
+            const char* env = std::getenv("GOW3_GPU_PROFILE");
+            return env && env[0] == '1';
+        }();
+        if (capture && !params.code.empty() && params.code.size_bytes() <= 256 * 1024) {
+            static std::atomic<bool> captured[2]{};
+            const unsigned slot = params.hash == 0x22e6e19e ? 0 : 1;
+            bool expected = false;
+            if (captured[slot].compare_exchange_strong(expected, true)) {
+                if (const char* dir = std::getenv("GOW3_GPU_USER_DIR")) {
+                    const auto path = fmt::format("{}/perf-cs-{:08x}.bin", dir, params.hash);
+                    if (auto* file = std::fopen(path.c_str(), "wb")) {
+                        const auto bytes = std::fwrite(params.code.data(), 1, params.code.size_bytes(), file);
+                        const bool ok = std::fclose(file) == 0 && bytes == params.code.size_bytes();
+                        std::printf("TLOU compute evidence: %08llx %zu bytes %s\n",
+                            (unsigned long long)params.hash, bytes, ok ? "saved" : "write failed");
+                    }
+                }
+            }
+        }
+    }
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     if (sel.worker) {
         // gow3: draw-preparation worker: look up only, with the worker's own Info copy.
@@ -1929,7 +1999,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
         // (copied while the programs lock is held: the GPU thread may add permutations)
         return std::make_tuple(&info, it->module, AssignFetch(fetch, it->spec.fetch_shader_data),
-                               HashCombine(params.hash, perm_idx));
+                               TlouComputeSplit::PermutationKey(params.hash, HashCombine(params.hash, perm_idx)));
     }
 
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
@@ -1985,7 +2055,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                         static_cast<unsigned long long>(params.hash));
         }
         auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = TlouComputeSplit::PermutationKey(params.hash, HashCombine(params.hash, 0));
 
         RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         new_program->AddPermut(module, std::move(spec));
@@ -2017,10 +2087,46 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    // Exact compute permutation memo. The SRT walker above ALWAYS runs:
+    // same pointer is not sufficient; its freshly resolved content, shader
+    // base and runtime specialization state must all match. The cache only
+    // bypasses rebuilding the permutation's descriptors and vectors.
+    static const bool compute_memo_enabled = [] {
+        const char* env = std::getenv("GOW3_TLOU_COMPUTE_MEMO");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    if (compute_memo_enabled && hw_stage == HwStage::Compute &&
+        program->compute_perm_memo.Matches(info.ProgramBase(), info.FlatUserData(),
+                                          runtime_info, program->modules.size())) {
+        const size_t idx = program->compute_perm_memo.Permutation();
+        // The validation hook rebuilds the full specialization and compares
+        // against the cached module. It must NEVER mask a mismatch.
+        static const bool verify = std::getenv("GOW3_TLOU_COMPUTE_MEMO_VERIFY") != nullptr;
+        bool equivalent = true;
+        if (verify) {
+            auto fresh = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            equivalent = program->modules[idx].spec == fresh;
+            if (!equivalent) {
+                program->compute_perm_memo.Invalidate();
+                std::fprintf(stderr, "TLOU compute memo: specialization mismatch shader %llx\n",
+                             static_cast<unsigned long long>(params.hash));
+            }
+        }
+        if (equivalent) {
+            program->last_used = idx;
+            info.AddBindings(binding);
+            const auto hash = TlouComputeSplit::PermutationKey(
+                params.hash, HashCombine(params.hash, idx));
+            return std::make_tuple(&program->info, program->modules[idx].module,
+                                   AssignFetch(fetch, program->modules[idx].spec.fetch_shader_data),
+                                   hash);
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
+    u64 perm_hash = TlouComputeSplit::PermutationKey(params.hash, HashCombine(params.hash, perm_idx));
 
     vk::ShaderModule module{};
 
@@ -2052,7 +2158,14 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+        perm_hash = TlouComputeSplit::PermutationKey(params.hash, HashCombine(params.hash, perm_idx));
+    }
+    if (compute_memo_enabled && hw_stage == HwStage::Compute &&
+        ExactComputeMemoSafe(info)) {
+        program->compute_perm_memo.Remember(info.ProgramBase(), info.FlatUserData(),
+                                            runtime_info, perm_idx);
+    } else if (hw_stage == HwStage::Compute) {
+        program->compute_perm_memo.Invalidate();
     }
     return std::make_tuple(&program->info, module,
                            AssignFetch(fetch, program->modules[perm_idx].spec.fetch_shader_data),

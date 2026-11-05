@@ -198,7 +198,9 @@ public:
 
     /// gow3: copies the GPU-modified parts of the ranges back to guest memory with one GPU wait
     /// (GPU thread). For data the GPU writes and CPU-side code (the SRT walker) reads.
-    void DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges);
+    // Only the SRT walker sets hot_srt=true, after draining the draw pipe.
+    // This allows conservative temporal gathering of completed GPU-written SRT tables.
+    void DownloadRanges(std::span<const std::pair<VAddr, u64>> ranges, bool hot_srt = false);
 
     /// gow3: GPU-written data newer than guest memory lies in [address, address + size).
     [[nodiscard]] bool IsRangeGpuWritten(VAddr address, u64 size) const {
@@ -368,6 +370,9 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    struct DownloadPiece { const Buffer* arena; VAddr address; u64 size, offset; };
+    u64 CopyMappedReadbackPieces(std::span<const DownloadPiece> pieces, u64 bytes, u64 max_bytes,
+                                 size_t primary_pieces = SIZE_MAX, u64* hot_published = nullptr);
 
     /// gow3: a CPU write fault next to, not on, GPU-written bytes: unprotects the page without
     /// a download (see LazyPage). False when the download is needed.

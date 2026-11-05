@@ -1,7 +1,10 @@
 #include <atomic>
 #include <algorithm>
+#include "video_core/renderer_vulkan/image_copy_plan.h"
 #include <unordered_map>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -11,6 +14,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_inline_copy_record.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -20,6 +24,16 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
+
+namespace {
+const bool tlou_inline_enabled = [] {
+    const char* value = std::getenv("TLOU_INLINE_SINGLE_COPY");
+    return value && value[0] == '1' && value[1] == 0;
+}();
+const bool tlou_inline_report = std::getenv("TLOU_INLINE_SINGLE_COPY") != nullptr;
+std::atomic<u64> tlou_inline_eligible{0};
+std::atomic<u64> tlou_inline_used{0};
+}
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
@@ -85,21 +99,20 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     return std::make_pair(src_layers, dst_layers);
 }
 
-static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format pixel_format) {
-    const u32 row_length = copy.bufferRowLength ? copy.bufferRowLength : copy.imageExtent.width;
-    const u32 height = copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
-
-    const auto block = vk::blockExtent(pixel_format);
-    const u32 block_size = vk::blockSize(pixel_format);
-    const u32 row_pitch = (row_length / block[0]) * block_size;
-    const u32 slice_pitch = (height / block[1]) * row_pitch;
-
-    const u32 width_in_blocks = (copy.imageExtent.width + block[0] - 1) / block[0];
-    const u32 height_in_blocks = (copy.imageExtent.height + block[1] - 1) / block[1];
-    const u32 num_slices = copy.imageExtent.depth * copy.imageSubresource.layerCount;
-
-    return (num_slices - 1) * slice_pitch + (height_in_blocks - 1) * row_pitch +
-           width_in_blocks * block_size;
+// Depth/stencil buffer transfers use a separate plane, not the combined
+// format's block size (for example D32_SFLOAT_S8_UINT depth is four bytes).
+static u32 CopyBlockBytes(vk::Format format,vk::ImageAspectFlags aspect) {
+    if(aspect==vk::ImageAspectFlagBits::eStencil) return 1;
+    if(aspect==vk::ImageAspectFlagBits::eDepth) {
+        return format==vk::Format::eD16Unorm || format==vk::Format::eD16UnormS8Uint ? 2 : 4;
+    }
+    return vk::blockSize(format);
+}
+static u64 BufferImageCopySize(const vk::BufferImageCopy& copy,const vk::Format format) {
+    const auto block=vk::blockExtent(format);
+    return ImageCopyPlan::BufferSpan(copy.imageExtent.width,copy.imageExtent.height,
+        copy.imageExtent.depth,copy.imageSubresource.layerCount,copy.bufferRowLength,
+        copy.bufferImageHeight,block[0],block[1],CopyBlockBytes(format,copy.imageSubresource.aspectMask));
 }
 
 // gow3 24 Oct 2026 diagnostics: buffer/image copy regions past the buffer's end or the image's
@@ -151,6 +164,18 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
 
 void Runtime::TickFrame() {
     staging_pool.TickFrame();
+    static auto last_copy_report = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_copy_report >= std::chrono::seconds(5)) {
+        last_copy_report = now;
+        const u64 eligible = tlou_inline_eligible.exchange(0, std::memory_order_relaxed);
+        const u64 used = tlou_inline_used.exchange(0, std::memory_order_relaxed);
+        if (tlou_inline_report) {
+            std::printf("TLOU inline copy record (5 s): eligible=%llu inlined=%llu mode=%d\n",
+                        static_cast<unsigned long long>(eligible),
+                        static_cast<unsigned long long>(used), int(tlou_inline_enabled));
+        }
+    }
 }
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
@@ -215,10 +240,21 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
                                  copies[i].size | u64(src->CpuAddr() + copies[i].srcOffset) << 24);
         }
     }
-    scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
-                      regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
-    });
+    // Record the same Vulkan copy with fewer CPU-side allocations for small
+    // single-region transfers. No upload, barrier, or semaphore is omitted.
+    const bool eligible_inline = InlineCopyRecord::Eligible(copies);
+    if (eligible_inline) {
+        tlou_inline_eligible.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (eligible_inline && tlou_inline_enabled) {
+        tlou_inline_used.fetch_add(1, std::memory_order_relaxed);
+        scheduler.Record(InlineCopyRecord::Single(src->Handle(), dst->Handle(), copies.front()));
+    } else {
+        scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
+                          regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
+        });
+    }
 
     if (bounded) {
         AccessBuffer(src, src_min, src_max - src_min, vk::PipelineStageFlagBits2::eCopy,
@@ -545,69 +581,66 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
-void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                                  const VideoCore::Buffer* buffer, u64 offset) {
-    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
-    const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
-
-    SetBackingSamples(dst, dst->info.num_samples, false);
-    SetBackingSamples(src, src->info.num_samples);
-
-    vk::BufferImageCopy buffer_copy = {
-        .bufferOffset = offset,
-        .bufferRowLength = 0,
-        .bufferImageHeight = 0,
-        .imageSubresource{
-            .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-            .mipLevel = 0u,
-            .baseArrayLayer = 0,
-            .layerCount = num_layers,
-        },
-        .imageOffset = {0, 0, 0},
-        // gow3 24 Oct 2026: what both images have (CopyImage).
-        .imageExtent = {std::min(src->info.size.width, dst->info.size.width),
-                        std::min(src->info.size.height, dst->info.size.height),
-                        std::min(src->info.size.depth, dst->info.size.depth)},
+void Runtime::CopyImageWithBuffer(VideoCore::Image* src,VideoCore::Image* dst) {
+    SetBackingSamples(dst,dst->info.num_samples,false);
+    SetBackingSamples(src,src->info.num_samples);
+    const auto describe=[](const VideoCore::Image& image) {
+        const auto& info=image.info;
+        const auto block=vk::blockExtent(info.pixel_format);
+        const auto aspect=image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+        return ImageCopyPlan::Image{info.size.width,info.size.height,info.size.depth,
+            info.resources.layers,info.resources.levels,
+            ConvertImageType(info.type)==vk::ImageType::e3D,block[0],block[1],
+            CopyBlockBytes(info.pixel_format,aspect)};
     };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
-
-    scheduler.EndRendering();
-
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    needs_flush |= IsBufferAccessed(buffer, offset, copy_size);
-    if (needs_flush) {
-        FlushBarriers();
+    const auto source=describe(*src),destination=describe(*dst);
+    const auto plan=ImageCopyPlan::Build(source,destination);
+    if(plan.empty()) return;
+    u64 size=0;
+    for(const auto& region:plan) size=std::max(size,region.bytes);
+    const auto alignment=std::lcm<u64>(4,std::lcm<u64>(source.block_bytes,destination.block_bytes));
+    const auto staging=staging_pool.Request(size,VideoCore::MemoryType::DeviceLocal,alignment);
+    struct Copy { vk::BufferImageCopy download,upload; };
+    std::vector<Copy> copies;
+    for(const auto& region:plan) {
+        vk::BufferImageCopy download{
+            .bufferOffset=staging.offset,.bufferRowLength=0,.bufferImageHeight=0,
+            .imageSubresource{src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,region.mip,0,region.src_layers},
+            .imageOffset={0,0,0},.imageExtent={region.src_width,region.src_height,region.src_depth}};
+        auto upload=download;
+        upload.imageSubresource=vk::ImageSubresourceLayers{
+            .aspectMask=dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+            .mipLevel=region.mip,.baseArrayLayer=0,.layerCount=region.dst_layers};
+        upload.imageExtent=vk::Extent3D{region.dst_width,region.dst_height,region.dst_depth};
+        copies.push_back({download,upload});
     }
-
-    const auto download_copy = buffer_copy;
-    buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      handle = buffer->Handle(), download_copy,
-                      upload_copy = buffer_copy](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
-                                 download_copy);
-        const vk::MemoryBarrier2 post_copy_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    scheduler.EndRendering();
+    bool flush=Transit(src,vk::ImageLayout::eTransferSrcOptimal,vk::PipelineStageFlagBits2::eCopy,
+                       vk::AccessFlagBits2::eTransferRead);
+    flush|=Transit(dst,vk::ImageLayout::eTransferDstOptimal,vk::PipelineStageFlagBits2::eCopy,
+                   vk::AccessFlagBits2::eTransferWrite);
+    flush|=IsBufferAccessed(staging.buffer,staging.offset,size,true);
+    if(flush) FlushBarriers();
+    scheduler.Record([src_image=src->GetImage(),dst_image=dst->GetImage(),
+                      handle=staging.buffer->Handle(),copies=std::move(copies)](vk::CommandBuffer cmdbuf) {
+        const auto barrier=[&](vk::AccessFlags2 source,vk::AccessFlags2 destination) {
+            const vk::MemoryBarrier2 memory{
+                .srcStageMask=vk::PipelineStageFlagBits2::eCopy,.srcAccessMask=source,
+                .dstStageMask=vk::PipelineStageFlagBits2::eCopy,.dstAccessMask=destination};
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1u,.pMemoryBarriers=&memory});
         };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .memoryBarrierCount = 1u,
-            .pMemoryBarriers = &post_copy_barrier,
-        });
-        cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
-                                 upload_copy);
+        for(size_t i=0;i<copies.size();++i) {
+            // The same scratch bytes are reused only after the preceding upload reads them.
+            if(i) barrier(vk::AccessFlagBits2::eTransferRead,vk::AccessFlagBits2::eTransferWrite);
+            cmdbuf.copyImageToBuffer(src_image,vk::ImageLayout::eTransferSrcOptimal,handle,copies[i].download);
+            barrier(vk::AccessFlagBits2::eTransferWrite,vk::AccessFlagBits2::eTransferRead);
+            cmdbuf.copyBufferToImage(handle,dst_image,vk::ImageLayout::eTransferDstOptimal,copies[i].upload);
+        }
     });
-
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    AccessBuffer(staging.buffer,staging.offset,size,vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+    dst->flags|=(src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->flags&=~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
@@ -666,35 +699,15 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        // gow3 24 Oct 2026: depth images of different formats (D32_SFLOAT_S8_UINT and
-        // D32_SFLOAT: 8 and 4 bytes a texel on NVIDIA) go through the copy buffer as well: an
-        // image copy between them is invalid (VUID-vkCmdCopyImage-srcImage-01548), and one came
-        // right before The Last of Us lost the device at a level change, every time.
+        // Depth formats must match for a direct image copy. Buffer copies use
+        // each format's selected depth plane, including across mip/array views.
         const bool depth_formats_differ = src->info.props.is_depth && dst->info.props.is_depth &&
                                           src->info.pixel_format != dst->info.pixel_format;
-        if (depth_formats_differ &&
-            (src->info.resources.levels != 1 || dst->info.resources.levels != 1 ||
-             src->info.resources.layers != dst->info.resources.layers)) {
-            // The buffer path copies one level of equal layers; the old contents are dropped
-            // instead (the game draws the depth target again).
-            static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-                std::printf("Depth copy between formats skipped: %s %u levels %u layers -> %s %u "
-                            "levels %u layers\n",
-                            vk::to_string(src->info.pixel_format).c_str(), src->info.resources.levels,
-                            src->info.resources.layers, vk::to_string(dst->info.pixel_format).c_str(),
-                            dst->info.resources.levels, dst->info.resources.layers);
-                std::fflush(stdout);
-            }
-        } else if (!depth_formats_differ && (instance.IsMaintenance8Supported() ||
-                                             src->info.props.is_depth == dst->info.props.is_depth)) {
+        if (!depth_formats_differ && (instance.IsMaintenance8Supported() ||
+                                     src->info.props.is_depth==dst->info.props.is_depth)) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
-            const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
-            CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
+            CopyImageWithBuffer(src,dst);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
                dst->info.props.is_depth) {

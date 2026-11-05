@@ -701,6 +701,10 @@ private:
     };
     std::array<RingStage, Shader::MaxStageTypes> ring_stages{};
     u32 num_ring_stages = 0;
+    const RingStage* FindRingStage(const Shader::Info& stage) const {
+        for (u32 i=0;i<num_ring_stages;++i) if(ring_stages[i].info==&stage) return &ring_stages[i];
+        return nullptr;
+    }
     const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const {
         for (u32 i = 0; i < num_ring_stages; ++i) {
             if (ring_stages[i].info == &stage) {

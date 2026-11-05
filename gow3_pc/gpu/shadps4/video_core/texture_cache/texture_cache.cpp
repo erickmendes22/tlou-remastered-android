@@ -1296,7 +1296,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+    // An exact-base lookup can only match an image indexed in the page containing
+    // 'address'. Scanning every page of the requested copy redundantly revisits
+    // unrelated overlapping images, and may scale with large depth/color buffers.
+    // ForEachImageInRegion filters by overlap; a positive 1-byte query preserves
+    // every candidate whose guest_address equals 'address'. This is the same
+    // first-page lookup invariant used by newer upstream shadPS4.
+    ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }

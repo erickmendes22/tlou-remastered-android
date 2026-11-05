@@ -22,6 +22,17 @@ const char *runtime_file_user_dir(void) { return test_user; }
 int runtime_file_translate(const char *guest, char *out, size_t size) { snprintf(out,size,"%s",guest); return 0; }
 
 int main(void) {
+    /* Base TLOU's Remote Play query must be bound and initialize exactly one
+     * int32 result, otherwise the offline game reads undefined stack data. */
+    assert(remoteplay_initialize()==0);
+    uintptr_t remote_query=runtime_services_resolve("g3PNjYKWqnQ#libSceRemoteplay");
+    assert(remote_query==(uintptr_t)remoteplay_connection_status);
+    typedef int32_t (ABI *RemoteQuery)(int32_t,int32_t*);
+    uint32_t remote_result[3]={0x13579bdfu,0xffffffffu,0x2468ace0u};
+    assert(((RemoteQuery)remote_query)(1,(int32_t*)&remote_result[1])==0);
+    assert(remote_result[0]==0x13579bdfu && remote_result[1]==0 && remote_result[2]==0x2468ace0u);
+    assert(((RemoteQuery)remote_query)(1,NULL)==(int32_t)0x80020016);
+    assert(runtime_services_resolve("unknown#libSceRemoteplay")==0);
     unsigned char param[128]={0}, result[64]={0}; /* the game zeroes the pointers it does not want */
     uint32_t value;
 

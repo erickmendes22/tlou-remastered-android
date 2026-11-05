@@ -52,6 +52,8 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
 void BeginChoice(const std::string& title, const std::vector<std::string>& items,
                  std::vector<Gow3Png::Image> pictures, int focus);
 int PollChoice();
+// Android PadBridge snapshot. Unlike desktop SDL events, buttons arrive from runtime_pad_bionic.c.
+void PublishPad(u32 buttons);
 
 /// A trophy popup (gow3_trophies.cpp): at the top right for a few seconds, one after another.
 /// `text` may hold a second line after a newline.
