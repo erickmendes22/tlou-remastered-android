@@ -8,10 +8,14 @@
 #include "core/emulator_settings.h"
 
 #include "video_core/cache_storage.h"
+#include "video_core/cache_io_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 #include <miniz.h>
+#ifdef __ANDROID__
+#include "gow3_threads.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -24,11 +28,7 @@
 
 namespace {
 
-std::mutex submit_mutex{};
-u32 num_requests{};
-std::condition_variable_any request_cv{};
-std::queue<std::packaged_task<void()>> req_queue{};
-std::mutex m_request{};
+Storage::CacheIOQueue io_queue;
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -37,38 +37,13 @@ bool ar_is_read_only{true};
 
 namespace Storage {
 
-void ProcessIO(const std::stop_token& stoken) {
+void ProcessIO(const std::stop_token& token) {
+    std::stop_callback stop{token, [] { io_queue.Close(); }};
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
-
-    while (!stoken.stop_requested()) {
-        {
-            std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
-            {
-                std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
-                }
-                request = std::move(req_queue.front());
-                req_queue.pop();
-            }
-
-            if (request.valid()) {
-                request();
-                request.get_future().wait();
-            }
-
-            --num_requests;
-        }
-    }
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply(nullptr,0);
+#endif
+    io_queue.Run();
 }
 
 constexpr std::string GetBlobFileExtension(BlobType type) {
@@ -119,6 +94,7 @@ void DataBase::Open() {
         }
     }
 
+    io_queue.Open();
     io_worker = std::jthread{ProcessIO};
     opened = true;
 }
@@ -128,7 +104,7 @@ void DataBase::Close() {
         return;
     }
 
-    io_worker.request_stop();
+    io_queue.Close();
     io_worker.join();
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -143,8 +119,7 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
+        auto request = std::packaged_task<void()>{[type, path = std::move(path_), v = std::move(v)]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
             if (EmulatorSettings.IsPipelineCacheArchived()) {
                 ASSERT_MSG(!ar_is_read_only,
@@ -155,7 +130,7 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
             } else {
                 // gow3: write beside and rename into place, so a game that ends during the
-                // write (the queue is not drained at exit) never leaves a truncated blob that
+                // write (for example a forced process exit) never leaves a truncated blob that
                 // the next start would load.
                 using namespace Common::FS;
                 auto temp{path};
@@ -188,14 +163,8 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
             }
         }};
-        std::scoped_lock lock{m_request};
-        req_queue.emplace(std::move(request));
+        return io_queue.Submit(std::move(request));
     }
-
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
-    request_cv.notify_one();
-    return true;
 }
 
 template <typename T>
@@ -464,17 +433,11 @@ void DataBase::Remove(BlobType type, const std::string& name) {
         return;
     }
     auto path = cache_path / (name + "." + GetBlobFileExtension(type));
-    {
-        std::scoped_lock lock{m_request};
-        req_queue.emplace([path = std::move(path)] {
-            std::error_code ignored;
-            std::filesystem::remove(path, ignored);
-            std::filesystem::remove(std::filesystem::path{path} += ".tmp", ignored);
-        });
-    }
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
-    request_cv.notify_one();
+    io_queue.Submit(CacheIOQueue::Task{[path = std::move(path)] {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        std::filesystem::remove(std::filesystem::path{path} += ".tmp", ignored);
+    }});
 }
 
 bool DataBase::WrittenTogether(BlobType type_a, const std::string& name_a, BlobType type_b,

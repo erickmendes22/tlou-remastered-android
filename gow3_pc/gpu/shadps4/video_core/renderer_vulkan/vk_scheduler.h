@@ -22,6 +22,7 @@
 #include <queue>
 
 #include "gow3_toggles.h"
+#include "video_core/renderer_vulkan/tlou_host_copy_batch.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -83,11 +84,16 @@ struct SubmitInfo {
     u32 num_signal_semas;
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+        // A submit can wait on up to four semaphores (graphics, present,
+        // transfer and the internal timeline). An unchecked append corrupts
+        // the submit data rather than reporting the actual caller error.
+        ASSERT_MSG(num_wait_semas < wait_semas.size(), "Too many Vulkan wait semaphores");
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT_MSG(num_signal_semas < signal_semas.size(), "Too many Vulkan signal semaphores");
         signal_semas[num_signal_semas] = semaphore;
         signal_ticks[num_signal_semas++] = tick;
     }
@@ -594,6 +600,7 @@ public:
     /// Returns false (and leaves `func` untouched) when the chunk has no room.
     template <typename Func>
     bool Push(Func&& func) {
+        last_host_batch = nullptr; // a different Vulkan command breaks copy adjacency
         using Command = TypedCommand<std::decay_t<Func>>;
         static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
         const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
@@ -612,8 +619,49 @@ public:
         return true;
     }
 
+    // Only the current unpublished chunk can receive new copy items.
+    // Command headers and items are placed directly in RecordChunk::storage:
+    // 1 item costs only sizeof(Item), not a reserved 16-item array.
+    [[nodiscard]] bool PushHostCopy(const Gow3Copy::Item& item, u64 sequence,
+                                    std::atomic<u64>& completed) {
+        static_assert(std::is_trivially_destructible_v<Gow3Copy::Item>);
+        if (last_host_batch) {
+            const size_t at = (used + alignof(Gow3Copy::Item) - 1) &
+                              ~(alignof(Gow3Copy::Item) - 1);
+            if (at + sizeof(Gow3Copy::Item) > Capacity) {
+                return false;
+            }
+            auto* next = new (storage + at) Gow3Copy::Item(item);
+            const bool appended = last_host_batch->batch.Append(next, sequence);
+            ASSERT(appended);
+            used = at + sizeof(Gow3Copy::Item);
+            PrefetchAhead();
+            return true;
+        }
+        using Command = HostCopyBatchCommand;
+        const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
+        const size_t item_offset = (offset + sizeof(Command) + alignof(Gow3Copy::Item) - 1) &
+                                   ~(alignof(Gow3Copy::Item) - 1);
+        if (item_offset + sizeof(Gow3Copy::Item) > Capacity) {
+            return false;
+        }
+        auto* first_item = new (storage + item_offset) Gow3Copy::Item(item);
+        auto* command = new (storage + offset) Command(completed, first_item, sequence);
+        if (last) {
+            last->next = command;
+        } else {
+            first = command;
+        }
+        last = command;
+        last_host_batch = command;
+        used = item_offset + sizeof(Gow3Copy::Item);
+        PrefetchAhead();
+        return true;
+    }
+
     /// Raw storage in the chunk for a command's variable-length data; null when full.
     void* Allocate(size_t bytes, size_t align) {
+        last_host_batch = nullptr; // conservative boundary for record-data ownership
         const size_t offset = (used + align - 1) & ~(align - 1);
         if (offset + bytes > Capacity) {
             return nullptr;
@@ -631,6 +679,7 @@ public:
             command = next;
         }
         first = last = nullptr;
+        last_host_batch = nullptr;
         used = 0;
     }
 
@@ -668,10 +717,19 @@ private:
         Func func;
     };
 
+    struct HostCopyBatchCommand final : CommandBase {
+        explicit HostCopyBatchCommand(std::atomic<u64>& done, Gow3Copy::Item* first,
+                                      u64 sequence)
+            : batch{done, first, sequence} {}
+        void Execute(vk::CommandBuffer) override { batch.Execute(); }
+        Detail::HostCopyBatch batch;
+    };
+
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
     CommandBase* first{};
     CommandBase* last{};
+    HostCopyBatchCommand* last_host_batch{};
 };
 
 class Scheduler {
@@ -843,6 +901,20 @@ public:
     /// guest memory may change once the guest has seen one.
     u64 GuestWriteEpoch() const {
         return guest_write_epoch.load(std::memory_order_relaxed);
+    }
+
+    /// Runs a contiguous batch of guest memory copies through the current
+    /// recording chunk, preserving intervening Vulkan-command boundaries.
+    void RecordHostCopyItem(const Gow3Copy::Item& item) {
+        ASSERT(IsRecordingDeferred());
+        ++record_serial;
+        const u64 sequence = ++host_copies_issued;
+        if (!record_chunk->PushHostCopy(item, sequence, host_copies_done)) {
+            full_chunks.push_back(std::move(record_chunk));
+            record_chunk = AcquireChunk();
+            const bool pushed = record_chunk->PushHostCopy(item, sequence, host_copies_done);
+            ASSERT(pushed);
+        }
     }
 
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for

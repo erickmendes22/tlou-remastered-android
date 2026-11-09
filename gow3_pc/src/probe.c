@@ -6,7 +6,11 @@
 #include <string.h>
 #include <inttypes.h>
 #include "runtime.h"
+#include "guest_cpu.h"
 #include "cpu_check.h"
+#ifdef __ANDROID__
+#include "android_cpu_policy.h"
+#endif
 #include "red_zone.h"
 #include "orb_hook.h"
 #include "cheat_hook.h"
@@ -15,8 +19,8 @@
 #include "runtime_mouselook.h"
 #include "runtime_gamesettings.h"
 #include "gpu/gow3gpu.h"
-#if !defined(__x86_64__) || !defined(__GNUC__)
-#error This prototype requires x86-64 GCC or Clang (including MinGW).
+#if !defined(__GNUC__)
+#error This loader requires GCC or Clang.
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -29,9 +33,14 @@
 #include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <sys/prctl.h>
+#else
 #include <execinfo.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include "crash_guest_dump.h"
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -103,9 +112,9 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     if (id >= import_count) fail("bad import trap index");
     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
     printf("API: %s\n", runtime_import_name(names[id]));
+    uintptr_t caller=guest_cpu_return_address((uintptr_t)__builtin_return_address(0))-(uintptr_t)image;
     printf("Caller return offset: 0x%" PRIxPTR "; first argument: 0x%" PRIxPTR "\n",
-           (uintptr_t)__builtin_return_address(0) - (uintptr_t)image, argument);
-    uintptr_t caller=(uintptr_t)__builtin_return_address(0)-(uintptr_t)image;
+           caller, argument);
     for (uint64_t m=0;m<module_count;++m)
         if (caller>=modules[m].base && caller-modules[m].base<modules[m].size)
             printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",caller-modules[m].base);
@@ -115,7 +124,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     fflush(NULL);
     _exit(20); /* no destructors: GPU, audio and guest threads are still running */
 }
-#ifndef _WIN32
+#if defined(GUEST_CPU_NATIVE) && !defined(_WIN32)
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
 __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
@@ -547,6 +556,8 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #endif
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
+    /* FEX JIT faults are handled before PS4 GPU page tracking. */
+    if (guest_cpu_handle_fault(sig,info,context)) return;
     /* GPU page tracking (write-protected guest pages) is resolved first, except during a
      * speculative read: see vectored_fault. */
     if (gpu_enabled && sig == SIGSEGV && !runtime_fault_recover && gow3gpu_handle_fault(context, info->si_addr)) return;
@@ -562,7 +573,9 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    GuestRegs regs={0};
+    int guest=guest_cpu_signal_regs(uc,&regs);
+    uintptr_t rip=guest ? (uintptr_t)regs.rip : guest_cpu_host_pc(uc);
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -574,6 +587,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+#ifdef __ANDROID__
+    /* Never unwind through a FEX JIT frame from a fatal signal. The Android
+     * unwinder/allocator can block or fault again before _exit. Registers and
+     * bounded guest frame reads do not acquire renderer/allocator locks. */
+    if (guest) dump_guest_fault_regs(2,&regs,(uintptr_t)image);
+#else
     if (gpu_enabled) gow3gpu_dump_guest_writes(context);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
@@ -586,6 +605,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
             snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
         ssize_t written_=write(2, line, strlen(line)); (void)written_;
     }
+#endif
     _exit(128 + sig);
 }
 #endif
@@ -599,11 +619,14 @@ static void write_hex(char *out, uint64_t v) {
 }
 static void dump_frames(ucontext_t *uc) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
-    uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    GuestRegs regs={0};
+    int guest=guest_cpu_signal_regs(uc,&regs);
+    uintptr_t rip=guest ? (uintptr_t)regs.rip : guest_cpu_host_pc(uc);
+    uintptr_t rbp=guest ? (uintptr_t)regs.gpr[GUEST_RBP] : 0;
     uint64_t tid=(uint64_t)gettid();
     /* First argument register: the lock address when a thread waits on a futex. */
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
-    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    write_hex(arg+6,tid); write_hex(arg+27,guest ? regs.gpr[GUEST_RDI] : 0);
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
@@ -677,6 +700,7 @@ extern void gow3_stat_multipliers_status(int damage, int orb_pickup);
 
 /* The hooks below find their sites by signature (src/signature.h), so they work in any region
  * and version of the game whose code matches; a site that is not found leaves its feature off. */
+#if defined(GUEST_CPU_NATIVE)
 static void install_cheats(Segment *segments, uint64_t count, uint64_t size) {
     const char *names[] = {"health", "magic", "item meter", "Rage of Sparta", "red orbs",
                            "Very Hard unlock", "infinite double jumps"};
@@ -909,6 +933,7 @@ static void install_stat_multipliers(Segment *segments, uint64_t count, uint64_t
     printf("Multipliers: damage %s, green/blue/gold orbs %s\n", damage ? "ready" : "unavailable",
            pickup ? "ready" : "unavailable");
 }
+ #endif /* PS4 instruction hooks are native x86-64-only. */
 /* G3PATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
@@ -984,11 +1009,18 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef __ANDROID__
+    tlou_cpu_policy_prepare();
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
+#ifndef __ANDROID__
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
+#endif
+    /* FEX uses runtime_low_map to keep guest pointers representable in 40 bits. */
+    guest_cpu_init(runtime_low_map);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
 #ifdef _WIN32
@@ -1028,11 +1060,16 @@ int main(int argc, char **argv) {
         }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
+#ifndef _WIN32
+    /* The red-zone relay code is Windows-only; reject instead of silently ignoring it. */
+    if (red_zone_file) { fputs("TLOU: --red-zone is currently Windows-only\n",stderr); return 2; }
+#endif
     if (argc < 2) {
         fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--check-imports] [--no-game-hooks] [--content-profile file] [--app0 dir] [--app0-overlay dir]... [--user dir] [--patches file] [--timeout seconds] [--guest-path /app0/file] [--guest-arg value]... | --vulkan-only\n", argv[0]);
         return 1;
     }
     /* The guest code needs the PS4's instruction sets (#33, #66); GOW3_CPU_CHECK=0 skips this. */
+#if defined(GUEST_CPU_NATIVE)
     const char *cpu_check = getenv("GOW3_CPU_CHECK");
     if (!cpu_check || strcmp(cpu_check, "0")) {
         char missing[128];
@@ -1042,6 +1079,7 @@ int main(int argc, char **argv) {
             return 20;
         }
     }
+#endif /* CPU features are emulated by FEX on ARM64. */
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];
@@ -1227,19 +1265,25 @@ int main(int argc, char **argv) {
         unsigned char *t = traps + i * 32;
         /* SysV: mov edi, index; movabs rax, handler; jmp rax. No fake return values. */
         uint32_t index = (uint32_t)i;
-        uintptr_t handler = (uintptr_t)unresolved;
+        uintptr_t handler = guest_cpu_host_function((void *)unresolved);
         t[0] = 0x48; t[1] = 0x89; t[2] = 0xfe; /* mov rsi,rdi: preserve arg0 */
         t[3] = 0xbf; memcpy(t + 4, &index, 4);
         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
         t[18] = 0xff; t[19] = 0xe0;
     }
+    /* Tell FEX about executable code and import stubs before relocation. */
+    guest_cpu_code((uintptr_t)image, round_page(size));
+    guest_cpu_code((uintptr_t)traps, round_page((import_count + 1) * 32));
     for (uint64_t i = 0; i < nr; ++i) {
         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
             uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
-            if (resolved) value = resolved + relocs[i].addend;
+            if (resolved) {
+                value = relocs[i].kind == 1 ? guest_cpu_host_function((void *)resolved)
+                                              : resolved + relocs[i].addend;
+            }
             else if (native_libc && bindings[relocs[i].value]) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
@@ -1267,14 +1311,20 @@ int main(int argc, char **argv) {
         _exit(missing ? 1 : 0); /* no destructors: GPU threads are running */
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+#if defined(GUEST_CPU_NATIVE)
     if (gpu_enabled) install_mouse_look(segments, ns, size);
+#endif
     runtime_gamesettings_set_image(image, size);
+#if defined(GUEST_CPU_NATIVE)
     if (gpu_enabled && game_hooks) {
         install_orb_multiplier(segments, ns, size);
         install_cheats(segments, ns, size);
         install_actor_watch(segments, ns, size);
         install_stat_multipliers(segments, ns, size);
     }
+#else
+    if (game_hooks) puts("TLOU: native instruction hooks disabled under FEX; verified image patches remain enabled.");
+#endif
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
@@ -1312,8 +1362,8 @@ int main(int argc, char **argv) {
         /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
         for (uint64_t m=0;m<module_count;++m) {
             printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
-            typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
-            int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);
+            const uint64_t init_args[3]={0,0,0};
+            int result=(int)guest_cpu_call((uintptr_t)(image+modules[m].init),3,init_args);
             printf("Module %" PRIu64 " initializer returned %d\n",m,result);
             if (result) fail("module initializer failed");
         }
@@ -1339,7 +1389,16 @@ int main(int argc, char **argv) {
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
     if (!stack) fail("cannot allocate guest main stack");
+#if defined(GUEST_CPU_NATIVE)
     enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
+#else
+    guest_cpu_thread_stack(stack+MAIN_STACK-64, MAIN_STACK-64);
+    const uint64_t entry_args[2]={(uint64_t)(uintptr_t)&params,guest_cpu_host_function((void *)guest_exit)};
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply("guest main",1);
+#endif
+    guest_cpu_call((uintptr_t)(image+entry),2,entry_args);
+#endif
 #endif
     fail("entry unexpectedly returned");
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/arch.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include <cstring>
 #include <functional>
@@ -8,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <array>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -382,6 +385,25 @@ static void LogFrameEvent(char kind) {
     }
 }
 
+// CPU time of the four critical threads, sampled only at five-second summaries.
+static std::array<std::int64_t,4> ReadRendererCpuTimes() {
+    std::array<std::int64_t,4> result{-1,-1,-1,-1};
+#ifdef __linux__
+    static const int main_clock = [] {
+        const char* value=std::getenv("TLOU_MAIN_CPU_CLOCK");
+        return value ? static_cast<int>(std::strtol(value,nullptr,10)) : -1;
+    }();
+    const int clocks[4]={main_clock,Gow3Stats::gpu_thread_clock.load(),Gow3Stats::draw_thread_clock.load(),
+                        Gow3Stats::recorder_thread_clock.load()};
+    for (unsigned i=0;i<4;++i) {
+        timespec time{};
+        if (clocks[i]!=-1 && clock_gettime(static_cast<clockid_t>(clocks[i]),&time)==0)
+            result[i]=std::int64_t(time.tv_sec)*1000000000+time.tv_nsec;
+    }
+#endif
+    return result;
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     LogFrameEvent('P');
     // Update HDR status before presenting, then present the frame (gow3: on the swap thread).
@@ -394,6 +416,63 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // gow3: GOW3_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("GOW3_FRAME_STATS", false);
+    static const bool light_summary = EmulatorSettingsImpl::Flag("TLOU_FRAME_SUMMARY", false);
+    if (light_summary && !frame_stats) {
+        // Flip-only timing reuses compile counters already maintained by the
+        // renderer. No per-draw profiling, readbacks or GPU timestamp queries.
+        using Clock = std::chrono::steady_clock;
+        static auto start = Clock::now(), last = start;
+        static u32 frames = 0;
+        static double worst = 0;
+        static auto cpu_previous = ReadRendererCpuTimes();
+        // These counters are already collected by the runtime. Read cumulative
+        // deltas, so full profiling remains off and no extra per-draw timers run.
+        const auto read_transfer_stats = [] {
+            return std::array<u64,11>{Gow3Stats::buffer_upload_bytes.load(),
+                Gow3Stats::buffer_upload_batches.load(),Gow3Stats::gpu_idle_ns.load(),
+                Gow3Stats::tick_wait_ns.load(),Gow3Stats::sync_recording_ns.load(),
+                Gow3Stats::host_copies_wait_ns.load(),Gow3Stats::copy_threads_wait_ns.load(),
+                Gow3Stats::frame_wait_ns.load(),Gow3Stats::submit_lock_ns.load(),
+                Gow3Stats::acquire_ns.load(),Gow3Stats::present_ns.load()};
+        };
+        static auto transfer_previous = read_transfer_stats();
+        const auto now = Clock::now();
+        worst = std::max(worst, std::chrono::duration<double,std::milli>(now-last).count());
+        last = now;
+        ++frames;
+        const double window = std::chrono::duration<double>(now-start).count();
+        if (window >= 5.0) {
+            const auto cpu_now=ReadRendererCpuTimes();
+            std::array<double,4> busy{-1,-1,-1,-1};
+            for (unsigned i=0;i<4;++i)
+                if (cpu_previous[i]>=0 && cpu_now[i]>=cpu_previous[i])
+                    busy[i]=100.0*double(cpu_now[i]-cpu_previous[i])/(window*1e9);
+            cpu_previous=cpu_now;
+            std::printf("TLOU CPU critical: main=%.1f%% command=%.1f%% draw=%.1f%% recorder=%.1f%% "
+                        "(100%%=one-core CPU time; -1=unavailable)\n",busy[0],busy[1],busy[2],busy[3]);
+            std::printf("TLOU frame summary: %.1f flips/s worst=%.1fms compiles=%u "
+                        "main-compile=%.1fms worker-compile=%.1fms compile-wait=%.1fms pending-draws=%u\n",
+                        frames/window,worst,Vulkan::g_gow3_compiles.exchange(0),
+                        Vulkan::g_gow3_compile_ns.exchange(0)/1e6,
+                        Vulkan::g_gow3_async_ns.exchange(0)/1e6,
+                        Vulkan::g_gow3_compile_wait_ns.exchange(0)/1e6,
+                        Vulkan::g_gow3_pending_draws.exchange(0));
+            const auto transfer_now=read_transfer_stats();
+            std::array<double,11> delta{};
+            for (unsigned i=0;i<delta.size();++i)
+                if (transfer_now[i]>=transfer_previous[i])
+                    delta[i]=double(transfer_now[i]-transfer_previous[i]);
+            transfer_previous=transfer_now;
+            std::printf("TLOU transfers: uploads=%.1fMiB batches=%.0f; waits over %.2fs: "
+                        "no-submissions=%.1fms gpu-ticks=%.1fms recording=%.1fms "
+                        "host-copies=%.1fms copy-workers=%.1fms free-frame=%.1fms "
+                        "submit-lock=%.1fms acquire=%.1fms present-ipc=%.1fms "
+                        "(instrumented overlapping wall times, not GPU busy time)\n",
+                        delta[0]/1048576.0,delta[1],window,delta[2]/1e6,delta[3]/1e6,
+                        delta[4]/1e6,delta[5]/1e6,delta[6]/1e6,delta[7]/1e6,delta[8]/1e6,delta[9]/1e6,delta[10]/1e6);
+            frames=0;worst=0;start=now;
+        }
+    }
     if (frame_stats) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point window_start = Clock::now(), last = window_start;
@@ -1015,7 +1094,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             if (left < std::chrono::microseconds(20)) {
                 // A few microseconds left: arming the timer would cost its whole wake-up delay.
                 while (std::chrono::steady_clock::now() < deadline) {
-                    __builtin_ia32_pause();
+                    COMMON_CPU_RELAX();
                 }
                 break;
             }

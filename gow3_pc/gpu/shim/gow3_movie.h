@@ -3,9 +3,11 @@
 // texel for texel with the display size it renders at (luma W x H, chroma W/2 x H/2 after
 // W * align(H, 64) bytes), assuming movies are as large as the screen; its movies are 1080p and
 // its frame buffers 4 MiB each, so above 1080p they came out green and tiled. The decoder
-// (shim/videodec2) also writes each frame scaled to the display size into a scratch frame of
-// guest memory, and the texture cache (ImageInfo) reads the planes from there. Without a scratch
-// frame the planes are read as decoded (right colors, 1:1 in a corner).
+// TLOU's Android C decoder scales into its existing guest video buffer when the
+// resized NV12 output fits, without consuming additional flexible guest memory.
+// The legacy C++ videodec2 shim also supports bounds-checked in-place scaling.
+// The texture cache (ImageInfo) remaps Y/UV to the recorded destination layout.
+// Larger target frames continue using a separate scratch-frame fallback.
 // GOW3_MOVIE_SIZE=<width>x<height> is that display size; unset, nothing
 // changes.
 
@@ -32,6 +34,10 @@ std::uint32_t ScaledRows();
 std::uint32_t ScaledChromaPitch();
 /// Bytes of a scratch frame: luma, then the chroma plane (ScaledRows() / 2 rows).
 std::uint64_t ScaledFrameBytes();
+// True when a scaled movie fits safely inside the existing decoder frame buffer (excluding
+// the reserved picture-info suffix). The source must not be smaller than the target.
+bool CanWriteInPlace(std::uint32_t source_width, std::uint32_t source_height,
+                     std::uint64_t available_bytes);
 
 // The movie player's conversion shader samples a frame at u = (x + 0.5) / 1920 and
 // v = (y + 0.5) / 1088 with those factors as literals, so above 1080p it covers only the top-left

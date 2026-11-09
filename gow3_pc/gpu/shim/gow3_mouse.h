@@ -4,7 +4,12 @@
 // game window has the focus and no menu is open; Alt+Tab or the in-game menu releases it.
 // The settings' mouse switch turns it off (GOW3_MOUSE=0 at start).
 
+#ifndef __ANDROID__
 #include <SDL3/SDL.h>
+#else
+struct SDL_Window;
+union SDL_Event;
+#endif
 
 namespace Gow3Mouse {
 

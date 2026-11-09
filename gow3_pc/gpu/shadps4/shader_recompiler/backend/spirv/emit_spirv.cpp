@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <span>
+#include <cstdio>
 #include <cstdlib>
 #include <type_traits>
 #include <utility>
@@ -11,6 +12,7 @@
 #include "common/assert.h"
 #include "common/func_traits.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/tlou_split_compute.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/translate/translate.h"
@@ -405,7 +407,16 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
     spv::ExecutionModel execution_model{};
     switch (info.sw_stage) {
     case SwStage::Compute: {
-        const std::array<u32, 3> workgroup_size{ctx.runtime_info.hw.cs.workgroup_size};
+        auto workgroup_size = ctx.runtime_info.hw.cs.workgroup_size;
+        const auto& info = ctx.info;
+        const bool group_ops = info.uses_group_quad || info.uses_group_shuffle ||
+                               info.uses_group_ballot || static_cast<u32>(info.shared_types) != 0;
+        if (TlouComputeSplit::Use(info.pgm_hash, workgroup_size,
+                                  ctx.runtime_info.hw.cs.shared_memory_size, group_ops)) {
+            workgroup_size[0] = TlouComputeSplit::PhysicalSize;
+            std::printf("TLOU split64 SPIR-V: shader %08llx LocalSize=64 virtual=1024\n",
+                        static_cast<unsigned long long>(info.pgm_hash));
+        }
         execution_model = spv::ExecutionModel::GLCompute;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
                              workgroup_size[1], workgroup_size[2]);

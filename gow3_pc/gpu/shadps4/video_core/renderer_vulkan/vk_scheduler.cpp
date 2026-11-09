@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/arch.h"
 #include "gow3_profiler.h"
 #include <thread>
 #include <algorithm>
@@ -212,7 +213,9 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 // gow3 25 Oct 2026 diagnostics (GOW3_PROFILE): time spent in the guest-write ordering waits by
 // the task that waited (g_wait_owner: offset from the image base, symbolized against the build),
 // every 5 s.
+#ifdef _WIN32
 extern "C" char __ImageBase;
+#endif
 static bool OrderWaitStatsEnabled() {
     static const bool on = std::getenv("GOW3_PROFILE") != nullptr;
     return on;
@@ -240,9 +243,20 @@ static void NoteOrderWait(int kind, std::chrono::steady_clock::time_point start)
     std::string text;
     for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
         const auto& [ns, key] = sorted[i];
+        // Windows has a PE image-base symbol; Android shared objects are ELF
+        // and may be relocated independently. Resolve the actual owner of each
+        // frame with dladdr rather than requiring the non-existent __ImageBase.
+        uintptr_t module_base = 0;
+#ifdef _WIN32
+        module_base = reinterpret_cast<uintptr_t>(&__ImageBase);
+#else
+        Dl_info module{};
+        if (key.first && dladdr(key.first, &module) != 0 && module.dli_fbase) {
+            module_base = reinterpret_cast<uintptr_t>(module.dli_fbase);
+        }
+#endif
         const auto offset = key.first ? static_cast<unsigned long long>(
-                                            reinterpret_cast<uintptr_t>(key.first) -
-                                            reinterpret_cast<uintptr_t>(&__ImageBase))
+                                            reinterpret_cast<uintptr_t>(key.first) - module_base)
                                       : 0ull;
         text += fmt::format(" {} by {}: {}x {:.1f} ms;", kinds[key.second],
                             key.first ? fmt::format("task +{:#x}", offset) : std::string{"draws"},
@@ -371,6 +385,13 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("gow3:VkRecorder");
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply("Vulkan recorder",1);
+#endif
+#ifndef _WIN32
+    if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0)
+        Gow3Stats::recorder_thread_clock.store(static_cast<int>(clock));
+#endif
 #ifdef _WIN32
     Gow3Profiler::Start(GetCurrentThreadId(), "Vulkan recording thread");
     Gow3Threads::ApplyGpuThreadPriority("Vulkan recording thread");
@@ -383,7 +404,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             Gow3Threads::Available() >= 12 ? 200 : 20);
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
-            __builtin_ia32_pause();
+            COMMON_CPU_RELAX();
             // The clock is read every 256 pauses, not per iteration.
             if (!(spins & 255) &&
                 (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
@@ -718,10 +739,25 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+    // VkSubmitInfo requires one stage mask PER wait semaphore. SubmitInfo
+    // holds four, but the old mask array held only two; a third wait read
+    // past the end of the array inside the Vulkan driver (undefined behavior).
+    static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
     };
+    static_assert(wait_stage_masks.size() == std::tuple_size_v<decltype(SubmitInfo::wait_semas)>);
+    if (info.num_wait_semas > 2) {
+        // Only the exceptional case that previously read past the stage-mask
+        // table. Do not turn on per-submit logging in the normal draw path.
+        static std::atomic<u32> unusual_waits_reported{0};
+        if (unusual_waits_reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("GPU submit: %u wait semaphores (four-mask safety path)\n",
+                        info.num_wait_semas);
+        }
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,

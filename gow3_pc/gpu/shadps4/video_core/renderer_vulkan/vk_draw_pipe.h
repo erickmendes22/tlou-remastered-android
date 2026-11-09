@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "gow3_threads.h"
+#include "gow3_toggles.h"
 #include "gow3_profiler.h"
 
 #include <array>
@@ -21,7 +22,9 @@
 #include <cstring>
 #include <memory>
 #include <thread>
-#include <x86intrin.h>
+#include "common/arch.h"
+#include "common/rdtsc.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe_busy_sample.h"
 
 #include "common/assert.h"
 #include "common/thread.h"
@@ -110,17 +113,23 @@ public:
         ++drains;
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
-        const u64 start = __rdtsc();
+        // The Android release does not enable GOW3_FRAME_STATS. Two serializing
+        // counter reads on every waiting drain add CPU cost without measuring
+        // useful emulator work. Preserve exact timings when explicitly profiling.
+        static const bool profile_drains = std::getenv("GOW3_FRAME_STATS") != nullptr;
+        const u64 start = profile_drains ? Common::FencedRDTSC() : 0;
         for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
             if (spins < 4096) {
-                __builtin_ia32_pause();
+                COMMON_CPU_RELAX();
             } else {
                 std::this_thread::yield();
             }
         }
-        const u64 waited = __rdtsc() - start;
-        drain_cycles += waited;
-        cycles_by_reason[slot] += waited;
+        if (profile_drains) {
+            const u64 waited = Common::FencedRDTSC() - start;
+            drain_cycles += waited;
+            cycles_by_reason[slot] += waited;
+        }
     }
 
     /// Stage A: position after the last committed packet; Reached(position) once B ran it.
@@ -129,6 +138,13 @@ public:
     }
     [[nodiscard]] bool Reached(u64 position) const noexcept {
         return consumed.load(std::memory_order_acquire) >= position;
+    }
+
+    /// Stage A: one acquire snapshot for several pending-write checks. Stage B
+    /// only advances consumed, so checking against a snapshot can conservatively
+    /// retain a completed write, but can never retire an unfinished one.
+    [[nodiscard]] u64 CompletedPosition() const noexcept {
+        return consumed.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] bool Idle() const noexcept {
@@ -153,18 +169,30 @@ private:
 
     void WaitForSpace(u64 at, u64 size) {
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
-            __builtin_ia32_pause();
+            COMMON_CPU_RELAX();
         }
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("gow3:DrawRec");
+#ifdef __ANDROID__
+        tlou_cpu_policy_apply("draw recording",1);
+#endif
+#ifndef _WIN32
+        if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0)
+            Gow3Stats::draw_thread_clock.store(static_cast<int>(clock));
+#endif
 #ifdef _WIN32
         Gow3Profiler::Start(GetCurrentThreadId(), "draw recording thread");
         Gow3Threads::ApplyGpuThreadPriority("draw recording thread");
 #endif
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
+        // The optional pipe report is the only reader of busy_cycles. Cache its
+        // status once instead of serializing two CPU-counter reads per packet.
+        const char* trim_stats=std::getenv("TLOU_DRAW_COUNTER_TRIM");
+        const bool sample_busy = std::getenv("GOW3_FRAME_STATS") != nullptr ||
+            !(trim_stats && trim_stats[0]=='1' && trim_stats[1]==0);
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,
@@ -184,7 +212,7 @@ private:
                     if (stop.stop_requested()) {
                         return;
                     }
-                    __builtin_ia32_pause();
+                    COMMON_CPU_RELAX();
                     if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                         const u32 seen = wake.load(std::memory_order_seq_cst);
                         sleeping.store(true, std::memory_order_seq_cst);
@@ -203,7 +231,7 @@ private:
                 consumed.store(at, std::memory_order_release);
                 continue;
             }
-            const u64 start = __rdtsc();
+            const u64 start = Detail::BeginDrawPipeBusySample(sample_busy);
             // gow3 21 Oct 2026, TEST KNOB (default off): GOW3_TEST_PIPE_DELAY_NS=<n> makes stage B
             // busy-wait n ns before each packet, like a slower or loaded CPU (laptops). Used to
             // reproduce the multithreaded late-constants race: stage A walks a draw's tables
@@ -216,11 +244,11 @@ private:
                 const auto until = std::chrono::steady_clock::now() +
                                    std::chrono::nanoseconds(test_delay_ns);
                 while (std::chrono::steady_clock::now() < until) {
-                    __builtin_ia32_pause();
+                    COMMON_CPU_RELAX();
                 }
             }
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            Detail::EndDrawPipeBusySample(sample_busy, start, busy_cycles);
             at += header->size;
             consumed.store(at, std::memory_order_release);
         }

@@ -8,6 +8,9 @@
 #include <ctime>
 #include <string>
 #include <thread>
+#ifdef __ANDROID__
+#include "../../../src/android_cpu_policy.h"
+#endif
 
 
 #include "common/error.h"
@@ -178,6 +181,9 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 #else
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply(nullptr,0);
+#endif
     pthread_t this_thread = pthread_self();
 
     const auto scheduling_type = SCHED_OTHER;

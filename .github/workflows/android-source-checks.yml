@@ -1,0 +1,45 @@
+name: TLOU Android source checks
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - 'tools/probe_tlou.py'
+      - 'android-launcher/**'
+      - '.github/workflows/android-source-checks.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'tools/probe_tlou.py'
+      - 'android-launcher/**'
+      - '.github/workflows/android-source-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  game-preparation-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate syntax
+        run: python3 -m compileall -q android
+      - name: Test SFO title guards and read-only update overlay
+        run: |
+          python3 -m pip install unicorn==2.1.4
+          python3 -m unittest discover -s android/tests -v
+      - name: Configure JDK for lightweight launcher preflight
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Generate native save-choice fixture used by launcher tests
+        run: python3 gow3_pc/tests/test_android_save_choice.py
+      - name: Compile launcher, unit tests and validate Android resources
+        run: gradle -p android-launcher :app:testReleaseUnitTest :app:lintVitalRelease --no-daemon --max-workers=2

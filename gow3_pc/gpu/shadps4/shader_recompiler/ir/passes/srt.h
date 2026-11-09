@@ -5,6 +5,7 @@
 
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
+#include "common/arch.h"
 #include "common/types.h"
 
 namespace Serialization {
@@ -13,7 +14,31 @@ struct Archive;
 
 namespace Shader {
 
+#ifdef ARCH_X86_64
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
+inline const void* SrtWalkerCode(PFN_SrtWalker walker) {
+    return reinterpret_cast<const void*>(walker);
+}
+#else
+/// Portable cache representation; ARM64 additionally compiles it to native code at load time.
+void RunSrtProgram(const u32* program, const u32* user_data, u32* flat_dst);
+struct SrtProgram;
+const void* SrtProgramCode(const SrtProgram* program);
+void RunSrtWalker(SrtProgram* program, const u32* user_data, u32* flat_dst);
+struct SrtWalker {
+    SrtProgram* program{};
+    void operator()(const u32* user_data, u32* flat_dst) const {
+        RunSrtWalker(program, user_data, flat_dst);
+    }
+    explicit operator bool() const { return program != nullptr; }
+    bool operator==(const SrtWalker&) const = default;
+};
+using PFN_SrtWalker = SrtWalker;
+static_assert(sizeof(PFN_SrtWalker) == sizeof(void*), "Preserve the shader cache layout");
+inline const void* SrtWalkerCode(PFN_SrtWalker walker) {
+    return SrtProgramCode(walker.program);
+}
+#endif
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
 struct PersistentSrtInfo {

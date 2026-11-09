@@ -794,6 +794,7 @@
 {"uq2Y5BFz0PE#libSceFiber","sceFiberGetInfo"},
 {"JzyT91ucGDc#libSceFiber","sceFiberRename"},
 {"k1SwgkMSOM8#libSceRemoteplay","sceRemoteplayInitialize"},
+{"g3PNjYKWqnQ#libSceRemoteplay","sceRemoteplayGetConnectionStatus"},
 {"BtqmpTRXHgk#libSceRtc","sceRtcGetTime_t"},
 {"3OMbYZBaa50#libScePlayGo","scePlayGoGetLanguageMask"},
 {"LosLlHOpNqQ#libScePlayGo","scePlayGoSetLanguageMask"},

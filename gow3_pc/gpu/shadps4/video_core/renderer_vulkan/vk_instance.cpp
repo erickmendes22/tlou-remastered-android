@@ -411,9 +411,19 @@ bool Instance::CreateDevice() {
         return false;
     };
 
-    // Required
+    // Required: the Android app owns the output Surface. The game process imports
+    // AHardwareBuffers and exports fences instead of using VkSwapchainKHR.
+#ifdef __ANDROID__
+    for (const char* extension : {VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+                                  VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+                                  VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME}) {
+        ASSERT_MSG(add_extension(extension),
+                   "Required Android AHardwareBuffer presentation extension unavailable: {}", extension);
+    }
+#else
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#endif
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),

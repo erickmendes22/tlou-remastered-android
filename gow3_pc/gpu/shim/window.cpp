@@ -1,3 +1,4 @@
+#ifndef __ANDROID__
 // gow3: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <algorithm>
 #include <cstdio>
@@ -251,3 +252,5 @@ bool WindowSDL::PollEvents() {
 }
 
 } // namespace Frontend
+
+#endif // !__ANDROID__

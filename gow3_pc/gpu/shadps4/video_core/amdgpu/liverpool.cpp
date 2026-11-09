@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 #include <chrono>
 #include <thread>
+#include <functional>
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -36,6 +37,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "gow3_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/pm4_packet_checksum.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h" // gow3: GOW3_READBACK_WAKE (scheduler)
@@ -344,6 +346,9 @@ bool g_readback_woken = false;               ///< guarded by the target's submit
 
 void Liverpool::ProcessLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply("GPU command",1);
+#endif
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         Gow3Stats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -817,7 +822,7 @@ static void TraceEopWrite(u64 address, u64 data) {
     std::printf("EOP trace: t=%.2f ms label %#llx = %#llx, counter %llu, thread %lu\n",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(data),
-                static_cast<unsigned long long>(counter), static_cast<unsigned long>(GetCurrentThreadId()));
+                static_cast<unsigned long long>(counter), static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
 }
 
 // GOW3_TEST_LATE_IRQ=<ms>:<seconds> (tests): every <seconds>, the end-of-pipe interrupts of the
@@ -1505,11 +1510,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 // workers both go through this function, and both fold every register-writing packet into a
 // running checksum: equal checksums at a draw mean equal register files.
 u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
-    for (u32 i = 0; i < count; ++i) {
-        checksum = (checksum ^ words[i]) * 0x9E3779B97F4A7C15ull;
-        checksum ^= checksum >> 29;
-    }
-    return checksum;
+    return Detail::PacketChecksum(checksum, words, count);
 }
 
 void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,

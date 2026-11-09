@@ -80,8 +80,7 @@ public:
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     /// gow3: mip 0 of an image sharing guest memory with `dst` (texture_cache aliasing).
     void CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst, const vk::Extent3D& extent);
-    void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                             const VideoCore::Buffer* buffer, u64 offset);
+    void CopyImageWithBuffer(VideoCore::Image* src,VideoCore::Image* dst);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);

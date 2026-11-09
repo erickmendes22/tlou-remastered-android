@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +47,12 @@ static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); retu
 
 /* ---- clocks and sleeping ---- */
 static struct timespec process_start;
+#ifdef GUEST_CPU_NATIVE
 static uint64_t native_tsc_hz;
+#endif
+#ifdef _WIN32
 static uint64_t native_process_start;
+#endif
 __attribute__((constructor)) static void remember_start(void) {
     clock_gettime(CLOCK_MONOTONIC,&process_start);
 #ifdef _WIN32
@@ -155,18 +160,33 @@ static ABI uint64_t process_time_counter(void) {
 #endif
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     scale_timespec(&t,&process_start);
-    return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
+    const uint64_t ns=(uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
+#ifndef GUEST_CPU_NATIVE
+    return (uint64_t)(((__uint128_t)ns*guest_cpu_tsc_frequency())/1000000000);
+#else
+    return ns;
+#endif
 }
-static ABI uint64_t process_time_frequency(void) { return native_tsc_hz ? native_tsc_hz : 1000000000; }
+static ABI uint64_t process_time_frequency(void) {
+#ifndef GUEST_CPU_NATIVE
+    return guest_cpu_tsc_frequency();
+#else
+    return native_tsc_hz ? native_tsc_hz : 1000000000;
+#endif
+}
 /* The guest's TSC is the process clock in nanoseconds. The raw rdtsc differs per core on some
  * hosts (3.9 s apart on a Xeon E5-2680 v4, #42), so a thread moving cores made the game jump. */
 static ABI uint64_t read_tsc(void) {
+#ifndef GUEST_CPU_NATIVE
+    /* Match inline FEX RDTSC: same scaled hardware counter, epoch and Hz. */
+    return guest_cpu_tsc();
+#endif
 #ifdef _WIN32
     if (native_tsc_hz) return __rdtsc();
 #endif
     return process_time_counter();
 }
-static ABI uint64_t tsc_frequency(void) { return native_tsc_hz ? native_tsc_hz : 1000000000; }
+static ABI uint64_t tsc_frequency(void) { return process_time_frequency(); }
 /* Shared with the GPU library so flip/label timestamps use the guest's clock. */
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
