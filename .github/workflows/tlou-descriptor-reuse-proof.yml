@@ -1,0 +1,61 @@
+name: TLOU Compute Descriptor Exact-Reuse Proof
+
+on:
+  push:
+    branches: [experiment/tlou-compute-descriptor-reuse-20261114]
+    paths:
+      - '.github/workflows/tlou-descriptor-reuse-proof.yml'
+      - 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/tlou_compute_descriptor_reuse.h'
+      - 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h'
+      - 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_common.cpp'
+      - 'gow3_pc/tests/test_tlou_compute_descriptor_reuse.cpp'
+      - 'gow3_pc/tests/test_tlou_buffer_descriptor_vulkan.cpp'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  descriptor-reuse-proof:
+    name: Exact GPU pixels and 2048-command recorder benchmark
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Mesa Vulkan software ICD, validation and GLSL compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers glslang-tools
+      - name: Verify exact identity, ranges, tick changes and direct-API invalidation
+        run: |
+          set -euo pipefail
+          mkdir -p out/descriptor-reuse
+          c++ -std=c++20 -O1 -g -UNDEBUG -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -I gow3_pc/gpu/shadps4 gow3_pc/tests/test_tlou_compute_descriptor_reuse.cpp -o out/descriptor-reuse/guards
+          out/descriptor-reuse/guards | tee out/descriptor-reuse/guards.txt
+      - name: Build exact GPU pixels + real Vulkan recorder benchmark
+        run: |
+          set -euo pipefail
+          python3 gow3_pc/tests/build_tlou_buffer_descriptor_shaders.py out/descriptor-reuse/shaders
+          c++ -std=c++20 -O2 -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unknown-pragmas -Wno-unused-value -I gow3_pc/gpu/shadps4 gow3_pc/tests/test_tlou_buffer_descriptor_vulkan.cpp -lvulkan -o out/descriptor-reuse/vulkan-test
+      - name: Verify 128 dispatched pixels with 127 safe skips and alternating recording cost
+        run: |
+          set -euo pipefail
+          export VK_ICD_FILENAMES=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$VK_ICD_FILENAMES"
+          VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT out/descriptor-reuse/vulkan-test out/descriptor-reuse/shaders > out/descriptor-reuse/driver.txt 2>&1
+          cat out/descriptor-reuse/driver.txt
+          if grep -E 'Validation Error|VUID-|SYNC-HAZARD' out/descriptor-reuse/driver.txt; then exit 1; fi
+          grep -q 'exact reuse outputs PASS' out/descriptor-reuse/driver.txt
+          grep -q 'COMPUTE REUSE real Vulkan' out/descriptor-reuse/driver.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TLOU-Compute-Descriptor-Reuse-${{ matrix.runner }}
+          path: |
+            out/descriptor-reuse/driver.txt
+            out/descriptor-reuse/guards.txt
+          if-no-files-found: warn
