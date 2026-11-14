@@ -7,6 +7,7 @@
 
 #include "video_core/renderer_vulkan/vk_descriptor_record.h"
 #include "video_core/renderer_vulkan/tlou_buffer_descriptor_template.h"
+#include "video_core/renderer_vulkan/tlou_mixed_descriptor_template.h"
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -58,6 +59,47 @@ void Pipeline::InitializeBufferDescriptorTemplate(u32 buffer_count) {
     if (result == vk::Result::eSuccess) {
         buffer_descriptor_template = std::move(update);
         buffer_descriptor_count = buffer_count;
+    }
+}
+
+
+void Pipeline::InitializeMixedDescriptorTemplate(std::span<const vk::DescriptorType> types) {
+    if (!uses_push_descriptors || types.size() < 6 ||
+        !VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDescriptorUpdateTemplate ||
+        !VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPushDescriptorSetWithTemplateKHR) {
+        return;
+    }
+    using Slot = Detail::MixedDescriptorSlot<vk::DescriptorBufferInfo, vk::DescriptorImageInfo>;
+    std::vector<vk::DescriptorUpdateTemplateEntry> entries;
+    entries.reserve(types.size());
+    for (u32 i = 0; i < types.size(); ++i) {
+        const auto type = types[i];
+        if (type != vk::DescriptorType::eStorageBuffer &&
+            type != vk::DescriptorType::eSampledImage &&
+            type != vk::DescriptorType::eSampler) {
+            return;
+        }
+        entries.push_back(vk::DescriptorUpdateTemplateEntry{
+            .dstBinding = i,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = type,
+            .offset = i * sizeof(Slot),
+            .stride = sizeof(Slot),
+        });
+    }
+    const vk::DescriptorUpdateTemplateCreateInfo info{
+        .descriptorUpdateEntryCount = static_cast<u32>(entries.size()),
+        .pDescriptorUpdateEntries = entries.data(),
+        .templateType = vk::DescriptorUpdateTemplateType::ePushDescriptorsKHR,
+        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+        .pipelineLayout = *pipeline_layout,
+        .set = 0,
+    };
+    auto [result, update] = instance.GetDevice().createDescriptorUpdateTemplateUnique(info);
+    if (result == vk::Result::eSuccess) {
+        mixed_descriptor_template = std::move(update);
+        mixed_descriptor_types.assign(types.begin(), types.end());
     }
 }
 
@@ -124,6 +166,28 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                 Detail::PushBufferDescriptorTemplate(cmdbuf, update, layout, buffers);
             });
             return;
+        }
+        if (mixed_descriptor_template) {
+            // Copy current descriptor infos into one compact snapshot. Only
+            // exact scalar buffer/image/sampler layouts enter this path; mip
+            // arrays, unusual writes and storage images retain the old path.
+            using Slot = Detail::MixedDescriptorSlot<vk::DescriptorBufferInfo,
+                                                      vk::DescriptorImageInfo>;
+            boost::container::small_vector<Slot, 32> payloads;
+            if (Detail::PackMixedDescriptors(
+                    std::span<const vk::WriteDescriptorSet>{set_writes},
+                    std::span<const vk::DescriptorType>{mixed_descriptor_types},
+                    vk::DescriptorType::eStorageBuffer,
+                    vk::DescriptorType::eSampledImage,
+                    vk::DescriptorType::eSampler, payloads)) {
+                scheduler.ReserveRecordData(payloads.size() * sizeof(Slot) + alignof(Slot) + 64);
+                const auto saved = scheduler.RecordData(std::span<const Slot>{payloads});
+                const vk::DescriptorUpdateTemplate update = *mixed_descriptor_template;
+                scheduler.Record([update, layout, saved](vk::CommandBuffer cmdbuf) {
+                    Detail::PushMixedDescriptorTemplate(cmdbuf, update, layout, saved);
+                });
+                return;
+            }
         }
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
