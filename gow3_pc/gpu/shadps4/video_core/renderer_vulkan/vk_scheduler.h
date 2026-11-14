@@ -23,6 +23,7 @@
 
 #include "gow3_toggles.h"
 #include "video_core/renderer_vulkan/tlou_host_copy_batch.h"
+#include "video_core/renderer_vulkan/tlou_compute_descriptor_reuse.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -797,6 +798,8 @@ public:
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
         ++record_serial; // the caller may record anything (RecordSerial)
+        ++descriptor_direct_epoch;
+        compute_descriptor_reuse.Invalidate(); // direct Vulkan calls may change bindings
         if (recording_threaded && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -835,6 +838,17 @@ public:
             const bool pushed = record_chunk->Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
+    }
+
+    // A true result means exactly the same descriptors are still bound for
+    // this compute pipeline layout in this command buffer generation.
+    [[nodiscard]] bool ComputeBufferDescriptorsIdentical(
+        vk::PipelineLayout layout, std::span<const vk::DescriptorBufferInfo> buffers) {
+        return compute_descriptor_reuse.Identical(CurrentTick(), descriptor_direct_epoch,
+                                                  layout, buffers, IsRecordingDeferred());
+    }
+    void InvalidateComputeDescriptorReuse() noexcept {
+        compute_descriptor_reuse.Invalidate();
     }
 
     /// gow3 20 Oct 2026: advances on every Record() and CommandBuffer() call and with every new
@@ -1079,6 +1093,9 @@ private:
     bool recording_threaded{false};
     std::atomic<u32> native_recorder_tid{0};
     u64 record_serial = 0; ///< gow3: see RecordSerial()
+    u64 descriptor_direct_epoch = 0;
+    Detail::ComputeDescriptorReuse<vk::DescriptorBufferInfo, vk::PipelineLayout>
+        compute_descriptor_reuse;
     /// gow3 20 Oct 2026: the draw scheduler counts its waits for the submit lock (Gow3Stats).
     bool count_lock_waits{false};
     std::jthread recorder_thread;
