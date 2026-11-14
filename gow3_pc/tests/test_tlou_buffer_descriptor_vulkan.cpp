@@ -153,6 +153,37 @@ int main(int argc, char** argv) {
     // only the large case to avoid noise around the small-call crossover.
     if(n==16) assert(producer[1][20]+consumer[1][20] < 0.95*(producer[0][20]+consumer[0][20]));
     }
+    if(n==8 && argc<=2) {
+      // Real software-Vulkan producer + driver record cost for 2048 identical
+      // descriptor payloads. The output-equivalence test above separately
+      // checks the 127 exact skips with changing push constants.
+      std::array<std::vector<double>,2> repeat_ns;
+      for (unsigned round=0;round<30;++round) for(unsigned pass=0;pass<2;++pass) {
+        const unsigned mode=pass^(round&1);
+        for(unsigned j=0;j<n;++j)
+          infos[j]={buffer,j*65536u+8192u,8192u};
+        Vulkan::Detail::ComputeDescriptorReuse<VkDescriptorBufferInfo, VkPipelineLayout> cache;
+        Check(vkResetCommandPool(device,pool,0));
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        Check(vkBeginCommandBuffer(cmd,&bi));
+        auto t0=std::chrono::steady_clock::now();
+        for(unsigned k=0;k<Calls;++k) {
+          const bool duplicate=mode && cache.Identical(
+              101,0,layout,std::span<const VkDescriptorBufferInfo>{infos},true);
+          if(!duplicate)push_production_template(cmd,update,layout,infos.data(),n);
+          vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&k);
+        }
+        Check(vkEndCommandBuffer(cmd));
+        const auto t1=std::chrono::steady_clock::now();
+        if(round>2) repeat_ns[mode].push_back(
+            std::chrono::duration<double,std::nano>(t1-t0).count()/Calls);
+      }
+      for(auto& v:repeat_ns)std::sort(v.begin(),v.end());
+      const double every=repeat_ns[0][repeat_ns[0].size()/2];
+      const double exact=repeat_ns[1][repeat_ns[1].size()/2];
+      std::printf("COMPUTE REUSE real Vulkan: every=%.1fns exact-reuse=%.1fns ratio=%.3f per dispatch; 2047 of 2048 pushes safely elided\\n",every,exact,exact/every);
+      assert(exact<every*0.95);
+    }
     vkDestroyDescriptorUpdateTemplate(device,update,nullptr);vkDestroyPipelineLayout(device,layout,nullptr);vkDestroyDescriptorSetLayout(device,set,nullptr);
     if(argc>1)CheckGraphicsDescriptors(device,physical,buffer,words,pool,cmd,argv[1],n,argc<=2);
   }
