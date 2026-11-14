@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           glslangValidator -V gow3_pc/tests/shaders/tlou_mixed_descriptor.comp -o out/tlou-mixed-proof/mixed.spv
-          c++ -std=c++20 -O2 -UNDEBUG -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-unused-value -I gow3_pc/gpu/shadps4 gow3_pc/tests/test_tlou_mixed_descriptor_vulkan.cpp -lvulkan -o out/tlou-mixed-proof/vulkan-test
+          c++ -std=c++20 -O2 -UNDEBUG -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-unused-value -Wno-missing-field-initializers -I gow3_pc/gpu/shadps4 gow3_pc/tests/test_tlou_mixed_descriptor_vulkan.cpp -lvulkan -o out/tlou-mixed-proof/vulkan-test
       - name: Validate 128 exact GPU outputs and compare driver recording cost
         run: |
           set -euo pipefail
