@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
   VkCommandBuffer cmd;Check(vkAllocateCommandBuffers(device,&cai,&cmd));
   std::printf("DRIVER %s api=%u.%u.%u\n",props.deviceName,VK_VERSION_MAJOR(props.apiVersion),VK_VERSION_MINOR(props.apiVersion),VK_VERSION_PATCH(props.apiVersion));
   constexpr unsigned Calls=2048;
+  const bool reuse_only = argc > 2 && std::strcmp(argv[2], "--reuse-only") == 0;
   for(unsigned n:{2u,4u,8u,16u}) {
     std::vector<VkDescriptorSetLayoutBinding> bindings(n);
     std::vector<VkDescriptorUpdateTemplateEntry> entries(n);
@@ -120,7 +121,7 @@ int main(int argc, char** argv) {
       std::printf("GPU EXACT buffers=%u: 128 changing offsets/ranges, legacy/template and exact reuse outputs PASS\n",n);
       vkDestroyPipeline(device,pipeline,nullptr);vkDestroyShaderModule(device,shader,nullptr);
     }
-    if(argc<=2) {
+    if(argc<=2 || reuse_only) {
     std::array<std::vector<double>,2> producer,consumer;
     for(unsigned round=0;round<42;++round) for(unsigned pass=0;pass<2;++pass) {
       const unsigned mode=pass^(round&1);
@@ -151,9 +152,9 @@ int main(int argc, char** argv) {
     std::printf("buffers=%u old_snapshot=%.1f template_snapshot=%.1f old_driver=%.1f template_driver=%.1f ns/call; saved_data=%zu bytes/call\n",n,producer[0][20],producer[1][20],consumer[0][20],consumer[1][20],n*sizeof(VkWriteDescriptorSet));
     // A candidate without a substantial gain must not release an APK. Gate
     // only the large case to avoid noise around the small-call crossover.
-    if(n==16) assert(producer[1][20]+consumer[1][20] < 0.95*(producer[0][20]+consumer[0][20]));
+    if(n==16 && !reuse_only) assert(producer[1][20]+consumer[1][20] < 0.95*(producer[0][20]+consumer[0][20]));
     }
-    if(n==8 && argc<=2) {
+    if(n==8 && (argc<=2 || reuse_only)) {
       // Real software-Vulkan producer + driver record cost for 2048 identical
       // descriptor payloads. The output-equivalence test above separately
       // checks the 127 exact skips with changing push constants.
