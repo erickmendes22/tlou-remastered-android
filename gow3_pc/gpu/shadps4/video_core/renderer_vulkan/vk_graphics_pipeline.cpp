@@ -117,18 +117,33 @@ GraphicsPipeline::GraphicsPipeline(
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
-    // Buffer-only depth/geometry passes use the same compact per-draw
-    // descriptor payload as compute. Mixed image/sampler layouts retain
-    // their existing path. Count the immutable stage layout once.
+    // The immutable scalar descriptor layout is known once, after creation.
+    // Every draw still supplies fresh handles, offsets and image layouts.
+    // Arrays of mips and writable images keep the original path.
     u32 template_buffers = 0;
     bool buffer_only_layout = true;
+    bool scalar_sampled_layout = true;
+    bool has_sampled_image = false;
+    std::vector<vk::DescriptorType> mixed_types;
     for (const auto* stage : GetStages()) {
         if (!stage) continue;
         template_buffers += static_cast<u32>(stage->buffers.size());
         buffer_only_layout &= stage->images.empty() && stage->samplers.empty();
+        mixed_types.insert(mixed_types.end(), stage->buffers.size(),
+                           vk::DescriptorType::eStorageBuffer);
+        for (const auto& image : stage->images) {
+            scalar_sampled_layout &=
+                !image.is_written && image.NumBindings(*stage) == 1;
+            has_sampled_image = true;
+            mixed_types.push_back(vk::DescriptorType::eSampledImage);
+        }
+        mixed_types.insert(mixed_types.end(), stage->samplers.size(),
+                           vk::DescriptorType::eSampler);
     }
     if (buffer_only_layout) {
         InitializeBufferDescriptorTemplate(template_buffers);
+    } else if (scalar_sampled_layout && has_sampled_image) {
+        InitializeMixedDescriptorTemplate(mixed_types);
     }
 
     if (!preloading) {
