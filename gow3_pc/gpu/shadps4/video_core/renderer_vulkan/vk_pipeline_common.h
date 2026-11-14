@@ -80,6 +80,7 @@ protected:
     [[nodiscard]] std::string GetDebugString() const;
     void RefreshTextureHelperEligibility();
     void InitializeBufferDescriptorTemplate(u32 buffer_count);
+    void InitializeMixedDescriptorTemplate(std::span<const vk::DescriptorType> types);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -90,6 +91,8 @@ protected:
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniqueDescriptorUpdateTemplate buffer_descriptor_template;
     u32 buffer_descriptor_count = 0;
+    vk::UniqueDescriptorUpdateTemplate mixed_descriptor_template;
+    std::vector<vk::DescriptorType> mixed_descriptor_types;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool texture_helper_compatible = false;
