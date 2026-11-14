@@ -138,7 +138,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                     const auto now = std::chrono::steady_clock::now();
                     if (now - stats.last >= std::chrono::seconds(5)) {
                         std::printf("TLOU compute descriptor reuse (5 s): "
-                                    "checked=%llu skipped=%llu hit-rate=%.1f%%\\n",
+                                    "checked=%llu skipped=%llu hit-rate=%.1f%%\n",
                                     static_cast<unsigned long long>(stats.checks),
                                     static_cast<unsigned long long>(stats.skipped),
                                     100.0 * double(stats.skipped) / double(stats.checks));
