@@ -105,6 +105,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
 
     // Bind descriptor set.
     if (set_writes.empty()) {
+        if (IsCompute()) scheduler.InvalidateComputeDescriptorReuse();
         return;
     }
 
@@ -113,6 +114,14 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
             Detail::MatchesBufferDescriptorTemplate(
                 std::span<const vk::WriteDescriptorSet>{set_writes}, source_buffers,
                 buffer_descriptor_count, vk::DescriptorType::eStorageBuffer)) {
+            // A second push of BIT-IDENTICAL compute descriptors in the same
+            // command buffer is redundant. The pipeline layout, submission tick,
+            // direct Vulkan mutation epoch, every handle, offset and range are
+            // checked. Push constants and dispatch commands are NOT skipped.
+            if (IsCompute() &&
+                scheduler.ComputeBufferDescriptorsIdentical(layout, source_buffers)) {
+                return;
+            }
             // The compact per-dispatch snapshot replaces the per-write copies
             // and pointer fixups, plus the driver's repeated write decoding.
             // Data and closure must stay in the same recording chunk.
@@ -125,6 +134,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
             });
             return;
         }
+        if (IsCompute()) scheduler.InvalidateComputeDescriptorReuse();
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
@@ -230,6 +240,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         return;
     }
 
+    if (IsCompute()) scheduler.InvalidateComputeDescriptorReuse();
     // Descriptor set updates are device calls: they stay on this thread.
     const auto desc_set = desc_heap.Commit(*desc_layout);
     for (auto& set_write : set_writes) {
