@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/arch.h"
 #include "gow3_profiler.h"
 #include <thread>
 #include <algorithm>
@@ -17,6 +18,10 @@
 #include <dlfcn.h>
 #endif
 #include <functional>
+#ifdef __ANDROID__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "gow3_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -28,6 +33,8 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/tlou_deferred_signal_wait.h"
+#include "video_core/renderer_vulkan/tlou_host_copy_wait.h"
 #include "gow3_threads.h"
 
 namespace Vulkan {
@@ -204,6 +211,8 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
         Gow3Copy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
             signal();
             done->fetch_add(1, std::memory_order_release);
+            // Wake target-sequence waiters without draining unrelated new copies.
+            done->notify_all();
         });
     });
     KickRecording(true);
@@ -212,7 +221,9 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 // gow3 25 Oct 2026 diagnostics (GOW3_PROFILE): time spent in the guest-write ordering waits by
 // the task that waited (g_wait_owner: offset from the image base, symbolized against the build),
 // every 5 s.
+#ifdef _WIN32
 extern "C" char __ImageBase;
+#endif
 static bool OrderWaitStatsEnabled() {
     static const bool on = std::getenv("GOW3_PROFILE") != nullptr;
     return on;
@@ -240,9 +251,20 @@ static void NoteOrderWait(int kind, std::chrono::steady_clock::time_point start)
     std::string text;
     for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
         const auto& [ns, key] = sorted[i];
+        // Windows has a PE image-base symbol; Android shared objects are ELF
+        // and may be relocated independently. Resolve the actual owner of each
+        // frame with dladdr rather than requiring the non-existent __ImageBase.
+        uintptr_t module_base = 0;
+#ifdef _WIN32
+        module_base = reinterpret_cast<uintptr_t>(&__ImageBase);
+#else
+        Dl_info module{};
+        if (key.first && dladdr(key.first, &module) != 0 && module.dli_fbase) {
+            module_base = reinterpret_cast<uintptr_t>(module.dli_fbase);
+        }
+#endif
         const auto offset = key.first ? static_cast<unsigned long long>(
-                                            reinterpret_cast<uintptr_t>(key.first) -
-                                            reinterpret_cast<uintptr_t>(&__ImageBase))
+                                            reinterpret_cast<uintptr_t>(key.first) - module_base)
                                       : 0ull;
         text += fmt::format(" {} by {}: {}x {:.1f} ms;", kinds[key.second],
                             key.first ? fmt::format("task +{:#x}", offset) : std::string{"draws"},
@@ -263,11 +285,14 @@ void Scheduler::WaitDeferredSignals() {
     Gow3Stats::WaitTimer timer{Gow3Stats::host_copies_wait_ns};
     const auto start = std::chrono::steady_clock::now();
     KickRecording(true);
-    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        // Helps the copy threads the signals wait for.
-        Gow3Copy::WaitAsync();
-        std::this_thread::yield();
-    }
+    // The former WaitAsync() inside this loop waited for global pool IDLE,
+    // including host uploads queued *after* the requested fence. This was an
+    // unnecessary serial barrier in the 01.11 scenes that fell to 10-30 FPS.
+    // Wait only for the captured signal sequence. Workers execute copies
+    // independently; when workers are disabled we still help their queue.
+    Detail::WaitForDeferredSignal(*deferred_signals_done, issued,
+                                  Gow3Copy::Enabled(),
+                                  [] { Gow3Copy::WaitAsync(); });
     if (OrderWaitStatsEnabled()) {
         NoteOrderWait(0, start);
     }
@@ -299,9 +324,10 @@ void Scheduler::WaitHostCopies() {
         Gow3Stats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         const auto start = std::chrono::steady_clock::now();
         KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
-        }
+        // A short spin keeps uncontended completions fast. For longer waits,
+        // park until the recorder publishes the required sequence instead of
+        // scheduling this thread repeatedly while game workers need CPU time.
+        Detail::WaitForHostCopySequence(host_copies_done, host_copies_issued);
         if (OrderWaitStatsEnabled()) {
             NoteOrderWait(1, start);
         }
@@ -371,6 +397,14 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("gow3:VkRecorder");
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply("Vulkan recorder",1);
+    native_recorder_tid.store(static_cast<u32>(syscall(SYS_gettid)), std::memory_order_release);
+#endif
+#ifndef _WIN32
+    if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0)
+        Gow3Stats::recorder_thread_clock.store(static_cast<int>(clock));
+#endif
 #ifdef _WIN32
     Gow3Profiler::Start(GetCurrentThreadId(), "Vulkan recording thread");
     Gow3Threads::ApplyGpuThreadPriority("Vulkan recording thread");
@@ -383,7 +417,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             Gow3Threads::Available() >= 12 ? 200 : 20);
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
-            __builtin_ia32_pause();
+            COMMON_CPU_RELAX();
             // The clock is read every 256 pauses, not per iteration.
             if (!(spins & 255) &&
                 (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
@@ -405,7 +439,15 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_busy = true;
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
+        // Counts are read from a fully published chunk; no per-host-copy
+        // atomics or clock reads are added to the critical producer path.
+        const u32 host_items = chunk->HostCopyItems();
+        const u32 host_groups = chunk->HostCopyGroups();
         chunk->Execute(current_cmdbuf);
+        if (host_items) {
+            recorder_host_copy_items.fetch_add(host_items, std::memory_order_relaxed);
+            recorder_host_copy_groups.fetch_add(host_groups, std::memory_order_relaxed);
+        }
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));
@@ -718,10 +760,25 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+    // VkSubmitInfo requires one stage mask PER wait semaphore. SubmitInfo
+    // holds four, but the old mask array held only two; a third wait read
+    // past the end of the array inside the Vulkan driver (undefined behavior).
+    static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
     };
+    static_assert(wait_stage_masks.size() == std::tuple_size_v<decltype(SubmitInfo::wait_semas)>);
+    if (info.num_wait_semas > 2) {
+        // Only the exceptional case that previously read past the stage-mask
+        // table. Do not turn on per-submit logging in the normal draw path.
+        static std::atomic<u32> unusual_waits_reported{0};
+        if (unusual_waits_reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("GPU submit: %u wait semaphores (four-mask safety path)\n",
+                        info.num_wait_semas);
+        }
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,

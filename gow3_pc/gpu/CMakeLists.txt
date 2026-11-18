@@ -26,6 +26,9 @@ if (GOW3_LTO)
     if (gow3_ipo_ok)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
     else()
+        if (ANDROID)
+            message(FATAL_ERROR "Android LTO was requested but is unavailable: ${gow3_ipo_error}")
+        endif()
         message(WARNING "LTO unavailable: ${gow3_ipo_error}")
     endif()
 endif()
@@ -53,7 +56,14 @@ elseif (GOW3_PGO STREQUAL "use")
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
-find_package(Vulkan REQUIRED)
+if(ANDROID)
+    # The Vulkan loader is supplied by the Android driver-chooser at runtime.
+    find_package(VulkanHeaders CONFIG REQUIRED)
+    add_library(Vulkan::Vulkan INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Vulkan PROPERTIES INTERFACE_LINK_LIBRARIES Vulkan::Headers)
+else()
+    find_package(Vulkan REQUIRED)
+endif()
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
 # gow3 (Windows): MSYS2 has no magic_enum/miniz packages; the submodules are used instead.
@@ -75,9 +85,15 @@ if (NOT VulkanMemoryAllocator_FOUND)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
-pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
-    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+if(ANDROID)
+    # No libSDL3/libX11 in Bionic. Android uses native AHardwareBuffer presentation.
+    add_library(PkgConfig::SDL3 INTERFACE IMPORTED)
+    add_library(PkgConfig::X11 INTERFACE IMPORTED)
+else()
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+    if (NOT WIN32)
+        pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+    endif()
 endif()
 find_package(miniz QUIET)
 if (NOT miniz_FOUND)
@@ -153,7 +169,11 @@ set(COMMON
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
+if(ANDROID)
+    set(PKG_CONFIG_ARGN --static)
+endif()
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+unset(PKG_CONFIG_ARGN)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for gow3-probe.exe to resolve, so the
 # library is static there and linked into the executable.
@@ -186,9 +206,33 @@ if (NOT WIN32)
     target_link_options(gow3gpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(gow3gpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
-target_link_libraries(gow3gpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    if(NOT TARGET fmt::fmt-header-only)
+        message(FATAL_ERROR "ARM64 build requires fmt::fmt-header-only (cross target/host ABI protection)")
+    endif()
+    set(TLOU_FMT_TARGET fmt::fmt-header-only)
+else()
+    set(TLOU_FMT_TARGET fmt::fmt)
+endif()
+target_link_libraries(gow3gpu PUBLIC Vulkan::Headers ${TLOU_FMT_TARGET} Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 target_include_directories(gow3gpu PRIVATE third_party/xbyak)
+if(ANDROID)
+    target_compile_definitions(gow3gpu PRIVATE VK_USE_PLATFORM_ANDROID_KHR GOW3_NO_SDL=1)
+    target_include_directories(gow3gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tools/android/present)
+    # FSR4's optional Vulkan backend still contains C API imports.
+    # Bind those to Android's system Vulkan loader; the main TLOU renderer
+    # retains its selected Vulkan ICD through vk_driver_loader.cpp.
+    # FSR4 is intentionally not enabled for Android until its dispatch path
+    # is converted to the selected driver.
+    target_link_libraries(gow3gpu PRIVATE nativewindow android log dl vulkan)
+    # The GPU shared object invokes HLE memory/thread/guest CPU APIs implemented
+    # by gow3-probe and libgow3cpu.so. Android's NDK applies --no-undefined
+    # by default; defer these symbols until the final executable's -rdynamic
+    # and audit checks, instead of shipping empty stubs that would break boot.
+    target_link_options(gow3gpu PRIVATE -Wl,--unresolved-symbols=ignore-all)
+    target_link_options(gow3gpu PRIVATE -Wl,--exclude-libs,libavcodec.a:libavformat.a:libavutil.a:libswscale.a:libswresample.a)
+endif()
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.

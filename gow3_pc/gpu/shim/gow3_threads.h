@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#ifdef __ANDROID__
+#include "../../src/android_cpu_policy.h"
+#endif
 #ifdef _WIN32
 #include <bit>
 #include <windows.h>
@@ -56,6 +59,11 @@ inline void ApplyGpuThreadPriority(const char* name) {
 /// Hardware threads available to the process.
 inline unsigned Available() {
     cpu_set_t set;
+#ifdef __ANDROID__
+    // Helper sizing must use the launch mask, not a critical thread's subset.
+    if (tlou_cpu_policy_enabled() && tlou_cpu_parse_mask(std::getenv("TLOU_BASE_CPU_SET"), &set))
+        return std::max(1, CPU_COUNT(&set));
+#endif
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
         return std::max(1, CPU_COUNT(&set));
@@ -65,6 +73,9 @@ inline unsigned Available() {
 
 /// The calling thread only runs on otherwise idle cores (falls back to the lowest nice level).
 inline void MakeBackground() {
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply(nullptr,0);
+#endif
     sched_param param{};
     if (sched_setscheduler(0, SCHED_IDLE, &param) != 0) {
         setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 19);

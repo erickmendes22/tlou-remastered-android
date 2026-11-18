@@ -1,3 +1,4 @@
+#ifndef __ANDROID__
 /* libSceAudioOut on SDL3 audio streams. sceAudioOutOutput returns once per
  * buffer period on a steady clock, like PS4 hardware: FMOD's output thread
  * reads 256-frame slots out of its mixer's 512-frame ring, and returning in
@@ -344,3 +345,5 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
+
+#endif // !__ANDROID__ (TLOU desktop SDL audio)

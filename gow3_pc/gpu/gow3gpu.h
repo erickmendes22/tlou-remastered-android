@@ -33,12 +33,22 @@ int gow3gpu_text_input_poll(char *out_utf8, uint64_t size);
  * poll: -1 while open, -2 cancelled, else the chosen index. */
 int gow3gpu_choice_begin(const char *title, const char *const *items, const char *const *images, int count, int focus);
 int gow3gpu_choice_poll(void);
+/* Structured Android save list. Strings are copied before returning. */
+typedef struct Gow3SaveChoiceEntry {
+    const char *directory, *title, *subtitle, *detail, *icon_path;
+    int64_t modified_time;
+    uint32_t user_param, is_new;
+} Gow3SaveChoiceEntry;
+int gow3gpu_save_choice_begin(const char *title, const Gow3SaveChoiceEntry *entries, int count, int focus);
+void gow3gpu_save_choice_cancel(void);
 /* Trophies (gow3_trophies.cpp): the running game's list (its trophy pack, a host path; the list
  * number 1-3; 128 earned flags), then each newly earned trophy, shown as a popup. */
 void gow3gpu_trophy_list(const char *pack_path, int list, const uint32_t earned[4]);
 void gow3gpu_trophy_earned(int id);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int gow3gpu_overlay_captures_input(void);
+// Bionic pad bridge publishes the PS4 button bitmask for in-app choice/dialog input.
+void gow3gpu_pad_publish(uint32_t buttons);
 /* Mouse movement since the last call (pixels) and held sources (bit 0 left, 1 middle, 2 right,
  * 3 X1, 4 X2, 5 wheel up, 6 wheel down); returns 1 while the mouse is captured (gow3_mouse.h). */
 int gow3gpu_mouse_take(float *dx, float *dy, unsigned *buttons);

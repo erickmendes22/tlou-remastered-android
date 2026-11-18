@@ -21,6 +21,7 @@
 #include "common/serdes.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "shader_recompiler/backend/spirv/tlou_split_compute.h"
 #include "common/thread.h"
 #include "gow3_overlay.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
@@ -45,8 +46,12 @@ static constexpr u32 PipelineKeyVersion = 5u; // gow3: Info layout (ImageResourc
 /// gow3: the cache name of a shader's SPIR-V. Shaders that gained multi-wave LDS barriers get a
 /// new name, so binaries cached before the fix are not found and only those shaders recompile.
 static std::string ShaderBinaryName(u64 pgm_hash, size_t perm_idx) {
-    return fmt::format("{:#018x}_{}{}", pgm_hash, perm_idx,
-                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "");
+    // Keep split64 SPIR-V separate from the original 1024-thread module.
+    // ShaderMeta checks the SPIR-V digest before accepting a stored pipeline.
+    const char* split = TlouComputeSplit::Enabled() && TlouComputeSplit::IsTarget(pgm_hash)
+                            ? "_tlou64v1" : "";
+    return fmt::format("{:#018x}_{}{}{}", pgm_hash, perm_idx,
+                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "", split);
 }
 } // namespace Serialization
 
@@ -774,7 +779,7 @@ u64 TakeBinaryHash(u64 perm_hash) {
 /// with. Metas of earlier builds have no hash (0): their files must have been written together.
 bool BinaryMatchesMeta(const std::vector<u32>& spv, u64 binary_hash, u64 pgm_hash,
                        size_t perm_idx) {
-    const auto meta_name = fmt::format("{:#018x}", HashCombine(pgm_hash, u64(perm_idx)));
+    const auto meta_name = fmt::format("{:#018x}", TlouComputeSplit::PermutationKey(pgm_hash, HashCombine(pgm_hash, u64(perm_idx))));
     const auto binary_name = Serialization::ShaderBinaryName(pgm_hash, perm_idx);
     auto& db = Storage::DataBase::Instance();
     const bool matches =
@@ -831,7 +836,7 @@ void FindCrowdedShaders() {
             if (std::sscanf(name.c_str(), "%llx_%zu", &pgm, &perm_idx) != 2) {
                 continue;
             }
-            const u64 perm_hash = HashCombine(pgm_hash, u64(perm_idx));
+            const u64 perm_hash = TlouComputeSplit::PermutationKey(pgm_hash, HashCombine(pgm_hash, u64(perm_idx)));
             db.Remove(Storage::BlobType::ShaderBinary, name);
             db.Remove(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash));
             db.Remove(Storage::BlobType::PipelineKey, fmt::format("c_{:#018x}", perm_hash));
@@ -879,7 +884,7 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 
     {
         std::scoped_lock lock{g_binary_hash_mutex};
-        g_binary_hashes[HashCombine(pgm_hash, u64(perm_idx))] =
+        g_binary_hashes[TlouComputeSplit::PermutationKey(pgm_hash, HashCombine(pgm_hash, u64(perm_idx)))] =
             XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
     }
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
@@ -915,6 +920,17 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
+
+    // Cache warm-up enumerates all stored compute pipelines, including the
+    // opposite TLOU split64 mode. Reject that metadata before loading its
+    // SPIR-V: treating a valid *other-mode* binary as damaged would delete
+    // the current mode's file and force recompiles on every mode switch.
+    if (info.hw_stage == Shader::HwStage::Compute &&
+        !TlouComputeSplit::AcceptCachedMeta(
+            info.pgm_hash, HashCombine(info.pgm_hash, u64(perm_idx)),
+            perm_hash_ar, TlouComputeSplit::Enabled())) {
+        return false;
+    }
 
     // Motion vertex shaders embed session-local buffer device addresses. They must be
     // recompiled for the current allocation, never loaded from a previous process.
@@ -1875,7 +1891,7 @@ void PersistentSrtInfo::Serialize(Serialization::Archive& ar) const {
 
     srt.Write(this, sizeof(*this));
     if (walker_func_size) {
-        srt.Write(reinterpret_cast<void*>(walker_func), walker_func_size);
+        srt.Write(SrtWalkerCode(walker_func), walker_func_size);
     }
 }
 
@@ -1883,10 +1899,12 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader srt{ar};
 
     srt.Read(this, sizeof(*this));
+    walker_func={}; // Never retain an address from the writing process.
 
     if (walker_func_size) {
         walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
         ar.Advance(walker_func_size);
+        if (!walker_func) return false;
     }
 
     return true;

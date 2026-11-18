@@ -88,6 +88,9 @@ inline std::atomic<std::int64_t> hot_pages{0};
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
 inline std::atomic<std::uint64_t> buffer_upload_bytes{0};
+inline std::atomic<std::uint64_t> buffer_upload_batches{0};
+inline std::atomic<int> draw_thread_clock{-1};
+inline std::atomic<int> recorder_thread_clock{-1};
 inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread
 inline std::atomic<unsigned long> gpu_thread_id{0}; ///< Windows thread id of the GPU command thread
 inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};

@@ -1,3 +1,6 @@
+#ifdef __ANDROID__
+#include "video_core/renderer_vulkan/vk_swapchain_ahb.h"
+#else
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -68,6 +71,15 @@ public:
 
     u32 GetFrameIndex() const {
         return frame_index;
+    }
+
+    // Shared presentation barrier API for native and Android AHB swapchains.
+    vk::ImageLayout PresentLayout() const { return vk::ImageLayout::ePresentSrcKHR; }
+    std::pair<u32, u32> AcquireQueues() const {
+        return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
+    }
+    std::pair<u32, u32> ReleaseQueues() const {
+        return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
     }
 
     vk::Extent2D GetExtent() const {
@@ -142,3 +154,5 @@ private:
 };
 
 } // namespace Vulkan
+
+#endif // __ANDROID__

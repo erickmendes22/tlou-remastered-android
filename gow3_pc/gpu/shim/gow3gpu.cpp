@@ -25,7 +25,9 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#ifndef __ANDROID__
 #include <SDL3/SDL.h>
+#endif
 #include "../gow3gpu.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -422,6 +424,7 @@ void WakeWindowThread() {
 }
 
 /// The window thread's wait between event pumps (see above).
+#ifndef __ANDROID__
 void WindowThreadIdle(SDL_Window* window) {
     static const bool backoff = [] {
         const char* env = std::getenv("GOW3_WINDOW_IDLE_BACKOFF");
@@ -442,20 +445,31 @@ void WindowThreadIdle(SDL_Window* window) {
     g_window_wake_cv.wait_for(lock, wait, [] { return g_window_wake; });
     g_window_wake = false;
 }
+#endif
 } // namespace
 
 double Gow3DisplayRefreshRate() {
     static const double hz = [] {
+#ifdef __ANDROID__
+        const char* display_hz = std::getenv("GOW3_DISPLAY_HZ");
+        return display_hz ? double(std::max(1, std::atoi(display_hz))) : 60.0;
+#else
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
         return mode && mode->refresh_rate > 0 ? double(mode->refresh_rate) : 0.0;
+#endif
     }();
     return hz;
 }
 
 u32 Gow3DisplayRefreshHz() {
     static const u32 hz = [] {
+#ifdef __ANDROID__
+        const char* display_hz = std::getenv("GOW3_DISPLAY_HZ");
+        const u32 rate = display_hz ? u32(std::max(1,std::atoi(display_hz))) : 60;
+#else
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
         const u32 rate = mode && mode->refresh_rate > 0 ? u32(mode->refresh_rate + 0.5f) : 60;
+#endif
         std::printf("GPU: vblank follows the display refresh rate, %u Hz\n", rate);
         return std::max<u32>(rate, 60);
     }();
@@ -514,7 +528,11 @@ extern "C" int gow3gpu_init(const Gow3GpuConfig* config) {
         }
         g_window_cv.notify_all();
         while (window->PollEvents()) {
+#ifdef __ANDROID__
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+#else
             WindowThreadIdle(window->GetSDLWindow());
+#endif
         }
         LOG_INFO(Frontend, "Window closed by user");
         std::fflush(stdout);
@@ -610,6 +628,10 @@ u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
 ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 } // namespace VideoCore
 
+extern "C" void gow3gpu_pad_publish(uint32_t buttons) {
+    Gow3Overlay::PublishPad(buttons);
+}
+
 extern "C" int gow3gpu_overlay_captures_input(void) {
     return Gow3Overlay::CapturesInput() ? 1 : 0;
 }
@@ -653,6 +675,14 @@ extern "C" int gow3gpu_choice_begin(const char* title, const char* const* items,
                              std::move(pictures), focus);
     return 1;
 }
+
+#ifdef __ANDROID__
+extern "C" void gow3gpu_save_choice_cancel(){Gow3Overlay::CancelSaveChoice();}
+extern "C" int gow3gpu_save_choice_begin(const char* title,const Gow3SaveChoiceEntry* entries,int count,int focus) {
+    if(!g_window || !entries || count<1 || count>256)return 0;
+    Gow3Overlay::BeginSaveChoice(title?title:"",entries,count,focus);return 1;
+}
+#endif
 
 extern "C" void gow3gpu_trophy_list(const char* pack_path, int list, const uint32_t earned[4]) {
     Gow3Trophies::SetList(pack_path ? pack_path : "", list, earned);

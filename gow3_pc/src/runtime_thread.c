@@ -7,6 +7,10 @@
  * the same 9-byte instruction with another displacement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
+#ifdef __ANDROID__
+#include "android_cpu_policy.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +24,6 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
-#include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -40,6 +43,9 @@ typedef struct GuestThread {
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
+    /* ARM64 FEX calls guest entries on their own low-VA stack. */
+    unsigned char *guest_stack;
+    size_t guest_stack_size;
     pthread_t host;
     GuestEntry entry;
     void *argument, *result;
@@ -56,6 +62,20 @@ typedef struct GuestThread {
 
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
+static void *thread_object_alloc(size_t bytes) {
+#ifdef __ANDROID__
+    return runtime_low_map(bytes,PROT_READ|PROT_WRITE);
+#else
+    return calloc(1,bytes);
+#endif
+}
+static void thread_object_free_attr(void *p) {
+#ifdef __ANDROID__
+    munmap(p,16384); /* low_map rounds small objects to PS4's 16 KiB page */
+#else
+    free(p);
+#endif
+}
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
 static _Thread_local int32_t guest_errno;
@@ -83,10 +103,12 @@ static void set_gs(void *base) {
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
 #else
-static void set_gs(void *base) {
-    if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
-}
+static void set_gs(void *base) { guest_cpu_set_gs(base); }
+#ifdef __ANDROID__
+#define tls_block_alloc(size) runtime_low_map(size,PROT_READ|PROT_WRITE)
+#else
 #define tls_block_alloc(size) aligned_alloc(64,size)
+#endif
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
@@ -106,7 +128,7 @@ static void attach(GuestThread *t) {
     current=t;
 }
 static GuestThread *new_thread(void) {
-    GuestThread *t=calloc(1,sizeof(*t));
+    GuestThread *t=thread_object_alloc(sizeof(*t));
     if (!t) return NULL;
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
@@ -183,7 +205,7 @@ int32_t *runtime_errno(void) { return &guest_errno; }
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
-    ThreadAttr *a=calloc(1,sizeof(*a));
+    ThreadAttr *a=thread_object_alloc(sizeof(*a));
     if (!a) return ERR(12);
     *a=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.inherit=4,.stack=DEFAULT_STACK,.guard=4096,.affinity=0x7f};
     pthread_mutex_lock(&lock); a->next=attributes; attributes=a; pthread_mutex_unlock(&lock);
@@ -197,7 +219,7 @@ static ABI int32_t attr_destroy(ThreadAttr **slot) {
     while (*link!=a) link=&(*link)->next;
     *link=a->next; a->magic=0;
     pthread_mutex_unlock(&lock);
-    free(a); *slot=NULL; return 0;
+    thread_object_free_attr(a); *slot=NULL; return 0;
 }
 static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
     ThreadAttr *a=find_attr(out);
@@ -328,6 +350,9 @@ static void apply_guest_scheduling(GuestThread *t,HANDLE h,const char *why) {
 #endif
 static void *host_start(void *p) {
     GuestThread *t=p;
+#ifdef __ANDROID__
+    tlou_cpu_policy_apply(NULL,0);
+#endif
     attach(t);
     set_host_name(t->name);
 #ifdef _WIN32
@@ -344,8 +369,34 @@ static void *host_start(void *p) {
         if (profile_guest_wanted(t->name)) gow3_profile_current(t->name);
     }
 #endif
-    if (!exit_setjmp(t)) t->result=t->entry(t->argument);
+    if (t->guest_stack) guest_cpu_thread_stack(t->guest_stack+t->guest_stack_size,t->guest_stack_size);
+    const uint64_t argument=(uint64_t)(uintptr_t)t->argument;
+    if (!exit_setjmp(t)) t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
+    else guest_cpu_abandon();
     runtime_thread_keys_cleanup();
+    // FEX no longer executes on the guest stack after destroying its thread.
+    // The Android port previously kept every 64 KiB DCLoader guest stack
+    // mapped for the lifetime of the process; transitions create hundreds.
+    guest_cpu_thread_end();
+#if defined(__ANDROID__) && !defined(GUEST_CPU_NATIVE)
+    if (t->guest_stack) {
+        munmap(t->guest_stack, t->guest_stack_size);
+        t->guest_stack = NULL;
+        t->guest_stack_size = 0;
+    }
+#endif
+#ifdef __ANDROID__
+    // The guest TLS belongs to this completed thread and its key destructors
+    // have already run. Do not retain a stale FEX TCB mapping per DCLoader.
+    if (t->tls_block) {
+        const size_t used = (size_t)((tls_offset() + 256 + 63) & ~(uint64_t)63);
+        // runtime_low_map reserves PS4 16 KiB pages, even when TLS is tiny.
+        const size_t mapped = (used + 16383u) & ~(size_t)16383u;
+        munmap(t->tls_block, mapped);
+        t->tls_block = NULL;
+        t->tcb = NULL;
+    }
+#endif
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
@@ -367,10 +418,24 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     /* Windows places the stack itself (low: no high-entropy ASLR) and commits all of it:
      * guest code has no stack probes and would step over the guard page. */
     pthread_attr_setstacksize(&host,stack_bytes);
+#elif defined(__ANDROID__)
+    // Bionic owns and reclaims the host pthread stack. Only the guest x86
+    // stack must be low-VA; FEX already allocates it separately below.
+    // pthread_attr_setstack with runtime_low_map permanently leaked a
+    // 320 KiB host stack for every short-lived DCLoader thread.
+    if (pthread_attr_setstacksize(&host,stack_bytes)) {
+        fprintf(stderr,"STOP: invalid Android pthread stack size %zu\n",stack_bytes);
+        exit(21);
+    }
 #else
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
+#endif
+#ifndef GUEST_CPU_NATIVE
+    t->guest_stack=runtime_low_map((size_t)stack,PROT_READ|PROT_WRITE);
+    if (!t->guest_stack) { fputs("STOP: cannot allocate guest thread stack\n",stderr); exit(21); }
+    t->guest_stack_size=(size_t)stack;
 #endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */

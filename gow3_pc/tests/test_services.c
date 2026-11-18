@@ -12,7 +12,26 @@ int64_t runtime_file_close(int fd) { (void)fd; return 0; }
 static int choice_next=-1;
 int gow3gpu_choice_begin(const char *title, const char *const *items, const char *const *images, int count, int focus) { (void)title; (void)items; (void)images; (void)focus; return count>0; }
 int gow3gpu_choice_poll(void) { return choice_next; }
-int runtime_savedata_param(int32_t user, const char *dir, void *param) { (void)user; (void)dir; (void)param; return -1; }
+int runtime_savedata_param(int32_t user, const char *dir, void *param) {
+    (void)user;(void)dir;memset(param,0,RUNTIME_SAVE_PARAM_SIZE);
+    memcpy(param,"The Last of Us",15);memcpy((unsigned char*)param+128,"The Outskirts",14);
+    memcpy((unsigned char*)param+256,"Real save description",22);
+    uint32_t user_param=42;int64_t date=1700000000;
+    memcpy((unsigned char*)param+1280,&user_param,4);memcpy((unsigned char*)param+1288,&date,8);return 0;
+}
+#ifdef GOW3_ANDROID_CHOICES_TEST
+static int save_choice_cancels;
+void gow3gpu_save_choice_cancel(void){++save_choice_cancels;}
+int gow3gpu_save_choice_begin(const char *title,const Gow3SaveChoiceEntry *entries,int count,int focus) {
+    assert(!strcmp(title,"Load game") && count==3 && focus==0);
+    assert(entries[0].is_new==1);
+    assert(!strcmp(entries[1].directory,"SAVE0001") && !strcmp(entries[2].directory,"SAVE0002"));
+    assert(!strcmp(entries[1].title,"The Last of Us") && !strcmp(entries[1].subtitle,"The Outskirts"));
+    assert(!strcmp(entries[1].detail,"Real save description"));
+    assert(entries[1].modified_time==1700000000 && entries[1].user_param==42);
+    return 1;
+}
+#endif
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size) { (void)user; (void)dir; (void)out; (void)size; return -1; }
 static int trophy_lists_shown, trophies_shown, trophy_last_shown=-1;
 void gow3gpu_trophy_list(const char *pack, int list, const uint32_t earned[4]) { (void)pack; (void)list; (void)earned; ++trophy_lists_shown; }
@@ -22,6 +41,17 @@ const char *runtime_file_user_dir(void) { return test_user; }
 int runtime_file_translate(const char *guest, char *out, size_t size) { snprintf(out,size,"%s",guest); return 0; }
 
 int main(void) {
+    /* Base TLOU's Remote Play query must be bound and initialize exactly one
+     * int32 result, otherwise the offline game reads undefined stack data. */
+    assert(remoteplay_initialize()==0);
+    uintptr_t remote_query=runtime_services_resolve("g3PNjYKWqnQ#libSceRemoteplay");
+    assert(remote_query==(uintptr_t)remoteplay_connection_status);
+    typedef int32_t (ABI *RemoteQuery)(int32_t,int32_t*);
+    uint32_t remote_result[3]={0x13579bdfu,0xffffffffu,0x2468ace0u};
+    assert(((RemoteQuery)remote_query)(1,(int32_t*)&remote_result[1])==0);
+    assert(remote_result[0]==0x13579bdfu && remote_result[1]==0 && remote_result[2]==0x2468ace0u);
+    assert(((RemoteQuery)remote_query)(1,NULL)==(int32_t)0x80020016);
+    assert(runtime_services_resolve("unknown#libSceRemoteplay")==0);
     unsigned char param[128]={0}, result[64]={0}; /* the game zeroes the pointers it does not want */
     uint32_t value;
 
@@ -71,6 +101,10 @@ int main(void) {
     choice_next=-2;
     assert(save_status()==DIALOG_FINISHED && save_result(out)==0);
     memcpy(&value,out+4,4); assert(value==SAVE_RESULT_CANCELED);
+#ifdef GOW3_ANDROID_CHOICES_TEST
+    assert(save_open(list)==0 && save_close()==0 && save_status()==DIALOG_FINISHED);
+    assert(save_result(out)==0);memcpy(&value,out+4,4);assert(value==SAVE_RESULT_CANCELED && save_choice_cancels==1);
+#endif
     assert(save_term()==0);
 
     /* PlayGo: installed, full speed, progress never divides by zero. */

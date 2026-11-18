@@ -1,0 +1,23 @@
+name: TLOU link symbol origins
+on:
+  push:
+    branches: [android-bionic-stage1]
+    paths: ['.github/workflows/tlou-link-symbol-origins.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  locate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locate original definitions and references of missing ELF symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '== Definitions and call sites, all game/engine sources =='
+          git grep -n -E '__ImageBase|runtime_exec_watch_retarget' -- gow3_pc ':!gow3_pc/gpu/third_party' || true
+          echo '== Executable watch platform gates =='
+          grep -n -B 8 -A 8 'runtime_exec_watch_retarget' gow3_pc/src/probe.c || true
+          echo '== ELF loader linker scripts =='
+          git grep -n -E 'export-dynamic|rdynamic|--no-undefined|--unresolved-symbols|--export-dynamic' -- android/bionic gow3_pc/gpu/CMakeLists.txt || true

@@ -1,3 +1,20 @@
+#ifdef __ANDROID__
+// No host X11 mouse on Bionic; Android sends input via the PS4 PadBridge.
+#include "gow3_mouse.h"
+namespace Gow3Mouse {
+bool Enabled() { return false; }
+void Update(SDL_Window*,bool) {}
+bool OnEvent(const SDL_Event&) { return false; }
+}
+extern "C" int gow3gpu_mouse_take(float *dx,float *dy,unsigned *buttons) {
+    if(dx) *dx=0; if(dy) *dy=0; if(buttons) *buttons=0; return 0;
+}
+extern "C" int gow3gpu_mouse_take_look(float *dx,float *dy) {
+    if(dx) *dx=0; if(dy) *dy=0; return 0;
+}
+extern "C" int gow3gpu_mouse_look_recent(void) { return 0; }
+extern "C" void gow3gpu_mouse_inject(float,float) {}
+#else
 #include "gow3_mouse.h"
 #include "gow3_settings.h"
 
@@ -136,3 +153,5 @@ extern "C" int gow3gpu_mouse_take(float* dx, float* dy, unsigned* buttons) {
     *buttons = held | (now < wheel_until[0] ? WheelUp : 0) | (now < wheel_until[1] ? WheelDown : 0);
     return captured ? 1 : 0;
 }
+
+#endif // __ANDROID__

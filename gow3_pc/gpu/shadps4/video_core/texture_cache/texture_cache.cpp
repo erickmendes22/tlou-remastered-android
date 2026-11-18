@@ -1296,7 +1296,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+    // An exact-base lookup can only match an image indexed in the page containing
+    // 'address'. Scanning every page of the requested copy redundantly revisits
+    // unrelated overlapping images, and may scale with large depth/color buffers.
+    // ForEachImageInRegion filters by overlap; a positive 1-byte query preserves
+    // every candidate whose guest_address equals 'address'. This is the same
+    // first-page lookup invariant used by newer upstream shadPS4.
+    ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }
@@ -1322,6 +1328,28 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                     size);
     }
     return {};
+}
+
+ImageId TextureCache::FindStencilPlaneDepth(VAddr address) {
+    ImageId depth_id{};
+    ForEachImageInRegion(address, 1, [&](ImageId, Image& image) {
+        if (image.info.guest_address == address) {
+            if (const ImageId id = GetAssociatedDepth(image)) {
+                depth_id = id;
+            }
+        }
+    });
+    return depth_id;
+}
+
+ImageId TextureCache::FindStencilTexture(VAddr address) {
+    ImageId texture_id{};
+    ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
+        if (image.info.guest_address == address && image.info.pixel_format == vk::Format::eR8Uint) {
+            texture_id = image_id;
+        }
+    });
+    return texture_id;
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,

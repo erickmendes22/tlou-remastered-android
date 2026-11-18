@@ -94,6 +94,7 @@ GraphicsPipeline::GraphicsPipeline(
     const auto started = Clock::now();
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    RefreshTextureHelperEligibility();
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -115,6 +116,20 @@ GraphicsPipeline::GraphicsPipeline(
                "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+
+    // Buffer-only depth/geometry passes use the same compact per-draw
+    // descriptor payload as compute. Mixed image/sampler layouts retain
+    // their existing path. Count the immutable stage layout once.
+    u32 template_buffers = 0;
+    bool buffer_only_layout = true;
+    for (const auto* stage : GetStages()) {
+        if (!stage) continue;
+        template_buffers += static_cast<u32>(stage->buffers.size());
+        buffer_only_layout &= stage->images.empty() && stage->samplers.empty();
+    }
+    if (buffer_only_layout) {
+        InitializeBufferDescriptorTemplate(template_buffers);
+    }
 
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;

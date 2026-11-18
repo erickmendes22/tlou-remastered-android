@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "gow3_threads.h"
+#include "gow3_toggles.h"
 #include "gow3_profiler.h"
 
 #include <array>
@@ -21,7 +22,11 @@
 #include <cstring>
 #include <memory>
 #include <thread>
-#include <x86intrin.h>
+#include "common/arch.h"
+#include "common/rdtsc.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe_busy_sample.h"
+#include "video_core/renderer_vulkan/tlou_draw_pipe_progress_wait.h"
+#include "video_core/renderer_vulkan/tlou_adaptive_pipe_drain.h"
 
 #include "common/assert.h"
 #include "common/thread.h"
@@ -108,19 +113,78 @@ public:
             return;
         }
         ++drains;
+        ++sync_stats.drain_waits;
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
-        const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                __builtin_ia32_pause();
-            } else {
-                std::this_thread::yield();
+        // The Android release does not enable GOW3_FRAME_STATS. Two serializing
+        // counter reads on every waiting drain add CPU cost without measuring
+        // useful emulator work. Preserve exact timings when explicitly profiling.
+        static const bool profile_drains = std::getenv("GOW3_FRAME_STATS") != nullptr;
+        const u64 start = profile_drains ? Common::FencedRDTSC() : 0;
+#ifdef __ANDROID__
+        if (ParkProducerEnabled()) {
+            const u64 target = head;
+            Detail::AdaptivePipeDrain(
+                [this, target] { return consumed.load(std::memory_order_acquire) >= target; },
+                [] { COMMON_CPU_RELAX(); }, [] { std::this_thread::yield(); },
+                [this, target] {
+                    Detail::WaitForPipeTargetProgress(
+                        consumed, target_signal, target,
+                        [] { COMMON_CPU_RELAX(); },
+                        sync_stats.parks, sync_stats.parked_ns, 0);
+                });
+        } else
+#endif
+        {
+            for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
+                if (spins < 4096) COMMON_CPU_RELAX();
+                else std::this_thread::yield();
             }
         }
-        const u64 waited = __rdtsc() - start;
-        drain_cycles += waited;
-        cycles_by_reason[slot] += waited;
+        if (profile_drains) {
+            const u64 waited = Common::FencedRDTSC() - start;
+            drain_cycles += waited;
+            cycles_by_reason[slot] += waited;
+        }
+    }
+
+    // A pending GPU-write dependency also waits for Stage B to reach its
+    // precise packet position; avoid burning a CPU core in this dependency.
+    void WaitUntil(u64 target) {
+        if (consumed.load(std::memory_order_acquire) >= target) return;
+        ++sync_stats.dependency_waits;
+#ifdef __ANDROID__
+        if (ParkProducerEnabled()) {
+            Detail::WaitForPipeTargetProgress(
+                consumed, target_signal, target,
+                [] { COMMON_CPU_RELAX(); }, sync_stats.parks, sync_stats.parked_ns);
+            return;
+        }
+#endif
+        for (u32 spins = 0; consumed.load(std::memory_order_acquire) < target; ++spins) {
+            if (spins < 4096) COMMON_CPU_RELAX();
+            else std::this_thread::yield();
+        }
+    }
+
+    struct SyncStats {
+        u64 drain_waits = 0;
+        u64 capacity_waits = 0;
+        u64 dependency_waits = 0;
+        u64 parks = 0;
+        u64 parked_ns = 0;
+        u64 notifications = 0;
+    };
+    // Stage A is the sole writer and reader of these per-window counters.
+    [[nodiscard]] SyncStats TakeSyncStats() {
+        auto values = sync_stats;
+#ifdef __ANDROID__
+        const u64 epoch = target_signal.epoch.load(std::memory_order_relaxed);
+        values.notifications = epoch - last_reported_notification_epoch;
+        last_reported_notification_epoch = epoch;
+#endif
+        sync_stats = {};
+        return values;
     }
 
     /// Stage A: position after the last committed packet; Reached(position) once B ran it.
@@ -129,6 +193,13 @@ public:
     }
     [[nodiscard]] bool Reached(u64 position) const noexcept {
         return consumed.load(std::memory_order_acquire) >= position;
+    }
+
+    /// Stage A: one acquire snapshot for several pending-write checks. Stage B
+    /// only advances consumed, so checking against a snapshot can conservatively
+    /// retain a completed write, but can never retire an unfinished one.
+    [[nodiscard]] u64 CompletedPosition() const noexcept {
+        return consumed.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] bool Idle() const noexcept {
@@ -141,6 +212,18 @@ public:
     std::atomic<u64> busy_cycles{0};
 
 private:
+    static bool ParkProducerEnabled() {
+#ifdef __ANDROID__
+        static const bool enabled = [] {
+            const char* env = std::getenv("GOW3_TLOU_PIPE_PARK");
+            return !(env && env[0] == '0' && env[1] == '\0');
+        }();
+        return enabled;
+#else
+        return false;
+#endif
+    }
+
     struct Header {
         u32 size;    ///< bytes to the next packet (0: wrap to the ring start)
         u32 payload; ///< bytes written by the producer
@@ -152,19 +235,43 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
+        if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) return;
+        ++sync_stats.capacity_waits;
+#ifdef __ANDROID__
+        if (ParkProducerEnabled()) {
+            // Capacity only needs Stage B to consume the overwritten prefix.
+            const u64 target = at + size - Capacity;
+            Detail::WaitForPipeTargetProgress(
+                consumed, target_signal, target,
+                [] { COMMON_CPU_RELAX(); }, sync_stats.parks, sync_stats.parked_ns);
+            return;
+        }
+#endif
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
-            __builtin_ia32_pause();
+            COMMON_CPU_RELAX();
         }
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("gow3:DrawRec");
+#ifdef __ANDROID__
+        tlou_cpu_policy_apply("draw recording",1);
+#endif
+#ifndef _WIN32
+        if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0)
+            Gow3Stats::draw_thread_clock.store(static_cast<int>(clock));
+#endif
 #ifdef _WIN32
         Gow3Profiler::Start(GetCurrentThreadId(), "draw recording thread");
         Gow3Threads::ApplyGpuThreadPriority("draw recording thread");
 #endif
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
+        // The optional pipe report is the only reader of busy_cycles. Cache its
+        // status once instead of serializing two CPU-counter reads per packet.
+        const char* trim_stats=std::getenv("TLOU_DRAW_COUNTER_TRIM");
+        const bool sample_busy = std::getenv("GOW3_FRAME_STATS") != nullptr ||
+            !(trim_stats && trim_stats[0]=='1' && trim_stats[1]==0);
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,
@@ -184,7 +291,7 @@ private:
                     if (stop.stop_requested()) {
                         return;
                     }
-                    __builtin_ia32_pause();
+                    COMMON_CPU_RELAX();
                     if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                         const u32 seen = wake.load(std::memory_order_seq_cst);
                         sleeping.store(true, std::memory_order_seq_cst);
@@ -200,10 +307,15 @@ private:
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
                 at += Capacity - at % Capacity;
+#ifdef __ANDROID__
+                if (ParkProducerEnabled()) Detail::PublishPipeTargetProgress(consumed, target_signal, at);
+                else consumed.store(at, std::memory_order_release);
+#else
                 consumed.store(at, std::memory_order_release);
+#endif
                 continue;
             }
-            const u64 start = __rdtsc();
+            const u64 start = Detail::BeginDrawPipeBusySample(sample_busy);
             // gow3 21 Oct 2026, TEST KNOB (default off): GOW3_TEST_PIPE_DELAY_NS=<n> makes stage B
             // busy-wait n ns before each packet, like a slower or loaded CPU (laptops). Used to
             // reproduce the multithreaded late-constants race: stage A walks a draw's tables
@@ -216,13 +328,18 @@ private:
                 const auto until = std::chrono::steady_clock::now() +
                                    std::chrono::nanoseconds(test_delay_ns);
                 while (std::chrono::steady_clock::now() < until) {
-                    __builtin_ia32_pause();
+                    COMMON_CPU_RELAX();
                 }
             }
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            Detail::EndDrawPipeBusySample(sample_busy, start, busy_cycles);
             at += header->size;
+#ifdef __ANDROID__
+            if (ParkProducerEnabled()) Detail::PublishPipeTargetProgress(consumed, target_signal, at);
+            else consumed.store(at, std::memory_order_release);
+#else
             consumed.store(at, std::memory_order_release);
+#endif
         }
     }
 
@@ -234,6 +351,10 @@ private:
     u32 pending_size = 0;
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
+    // Sequenced with PublishPipeProgress on Stage B, so no missed wakeups.
+    Detail::PipeTargetSignal target_signal{};
+    u64 last_reported_notification_epoch = 0; // Stage A only
+    SyncStats sync_stats{};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::atomic<u32> stage_b_tid{0};

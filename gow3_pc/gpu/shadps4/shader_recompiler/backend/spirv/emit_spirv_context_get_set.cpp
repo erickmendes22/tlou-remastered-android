@@ -5,6 +5,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/backend/spirv/tlou_split_compute.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/ir/patch.h"
@@ -216,6 +217,11 @@ Id EmitGetAttributeU1(EmitContext& ctx, IR::Attribute attr, u32 comp) {
 }
 
 Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
+    const bool split64 = ctx.info.sw_stage == SwStage::Compute &&
+        TlouComputeSplit::Use(ctx.info.pgm_hash, ctx.runtime_info.hw.cs.workgroup_size,
+            ctx.runtime_info.hw.cs.shared_memory_size,
+            ctx.info.uses_group_quad || ctx.info.uses_group_shuffle ||
+            ctx.info.uses_group_ballot || static_cast<u32>(ctx.info.shared_types) != 0);
     switch (attr) {
     case IR::Attribute::VertexId:
         return ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
@@ -227,13 +233,26 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
         return ctx.OpLoad(ctx.U32[1], ctx.base_instance);
     case IR::Attribute::WorkgroupIndex:
         return ctx.workgroup_index_id;
-    case IR::Attribute::WorkgroupId:
-        return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), comp);
+    case IR::Attribute::WorkgroupId: {
+        const Id physical = ctx.OpCompositeExtract(ctx.U32[1],
+            ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), comp);
+        return split64 && comp == 0
+            ? ctx.OpShiftRightLogical(ctx.U32[1], physical, ctx.ConstU32(4u)) : physical;
+    }
     case IR::Attribute::LocalInvocationId:
-        return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id),
-                                      comp);
-    case IR::Attribute::LocalInvocationIndex:
-        return ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index);
+    case IR::Attribute::LocalInvocationIndex: {
+        const Id physical = attr == IR::Attribute::LocalInvocationIndex
+            ? ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index)
+            : ctx.OpCompositeExtract(ctx.U32[1],
+                ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id), comp);
+        if (!split64 || (attr == IR::Attribute::LocalInvocationId && comp != 0))
+            return physical;
+        const Id group = ctx.OpCompositeExtract(ctx.U32[1],
+            ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0);
+        const Id slot = ctx.OpBitwiseAnd(ctx.U32[1], group, ctx.ConstU32(15u));
+        return ctx.OpIAdd(ctx.U32[1],
+            ctx.OpShiftLeftLogical(ctx.U32[1], slot, ctx.ConstU32(6u)), physical);
+    }
     case IR::Attribute::SampleIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.sample_index);
     case IR::Attribute::SampleMask:

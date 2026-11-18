@@ -6,8 +6,19 @@
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
+#include "common/arch.h"
+#ifdef ARCH_X86_64
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#else
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <cstdlib>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "shader_recompiler/ir/passes/srt_arm64.h"
+#endif
 #include "gow3_toggles.h"
 #include "common/arch.h"
 #include "common/decoder.h"
@@ -222,6 +233,151 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     return true;
 }
 
+} // namespace
+
+#else
+
+namespace {
+using namespace Shader::Arm64Srt;
+} // namespace
+
+namespace Shader {
+
+struct NativeSrtCode {
+    using Function = void (*)(const u32*, u32*);
+    Function function{};
+    std::atomic<bool> enabled{true};
+    void* mapping = nullptr;
+    size_t size{};
+    ~NativeSrtCode() {
+#ifdef ARCH_ARM64
+        if (mapping) munmap(mapping, size);
+#endif
+    }
+};
+
+static NativeSrtCode* CompileNativeSrt(std::span<const u32> program) {
+#ifdef ARCH_ARM64
+    static const bool enabled = [] {
+        const char* value = std::getenv("GOW3_SRT_NATIVE");
+        return !value || value[0] != '0';
+    }();
+    if (!enabled) return nullptr;
+    const auto code = Arm64Srt::Compile(program);
+    if (code.empty()) return nullptr;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return nullptr;
+    auto native = std::make_unique<NativeSrtCode>();
+    native->size = (code.size() * sizeof(u32) + size_t(page) - 1) & ~(size_t(page) - 1);
+    native->mapping = mmap(nullptr, native->size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (native->mapping == MAP_FAILED) { native->mapping = nullptr; return nullptr; }
+    std::memcpy(native->mapping, code.data(), code.size() * sizeof(u32));
+    auto* begin = static_cast<char*>(native->mapping);
+    __builtin___clear_cache(begin, begin + native->size);
+    if (mprotect(native->mapping, native->size, PROT_READ | PROT_EXEC)) return nullptr;
+    native->function = reinterpret_cast<NativeSrtCode::Function>(native->mapping);
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<NativeSrtCode>> mappings;
+    std::scoped_lock lock{mutex};
+    auto* result = native.get();
+    mappings.push_back(std::move(native));
+    return result;
+#else
+    (void)program;
+    return nullptr;
+#endif
+}
+
+struct SrtProgram {
+    std::vector<u32> words;
+    NativeSrtCode* native{};
+};
+
+const void* SrtProgramCode(const SrtProgram* program) {
+    return program ? program->words.data() : nullptr;
+}
+
+void RunSrtWalker(SrtProgram* stored, const u32* user_data, u32* flat) {
+    const auto* program = stored->words.data();
+    auto* native = stored->native;
+    if (native && native->enabled.load(std::memory_order_relaxed)) {
+        // Speculative callers must see a fault, rather than accept zero tables.
+        if (runtime_fault_recover) {
+            native->function(user_data, flat);
+            return;
+        }
+        // Use the runtime's existing fault boundary. A fault retries with the interpreter,
+        // which recovers individual loads without changing persisted bytecode.
+        sigjmp_buf* const previous = runtime_fault_recover;
+        sigjmp_buf recover;
+        if (sigsetjmp(recover, 0) == 0) {
+            runtime_fault_recover = &recover;
+            native->function(user_data, flat);
+            runtime_fault_recover = previous;
+            return;
+        }
+        runtime_fault_recover = previous;
+        native->enabled.store(false, std::memory_order_relaxed);
+    }
+    RunSrtProgram(program, user_data, flat);
+}
+
+
+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    u32 magic = 0;
+    if (size < 8 || size % 4 != 0 ||
+        (std::memcpy(&magic, ptr, sizeof(magic)), magic != SrtMagic)) {
+        LOG_ERROR(Render_Recompiler, "SRT walker in shader cache is not an SRT program");
+        return {};
+    }
+    auto program = std::make_unique<SrtProgram>();
+    program->words.resize(size / sizeof(u32));
+    std::memcpy(program->words.data(), ptr, size);
+    // Validate the portable program even if executable mappings are unavailable.
+    if (Arm64Srt::Compile(program->words).empty()) return {};
+    program->native = CompileNativeSrt(program->words);
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<SrtProgram>> programs;
+    std::scoped_lock lock{mutex};
+    auto* result = program.get();
+    programs.push_back(std::move(program));
+    return SrtWalker{result};
+}
+
+// Unlike permanently patching a load, a transient invalid table must not poison
+// the shader or its persisted cache for later draws.
+template<class T>
+static T ReadSrtValue(const void* address) {
+    T value{};
+    if (runtime_fault_recover) {
+        std::memcpy(&value,address,sizeof(value));
+        return value;
+    }
+    sigjmp_buf recover;
+    if (sigsetjmp(recover,0)==0) {
+        runtime_fault_recover=&recover;
+        std::memcpy(&value,address,sizeof(value));
+    } else {
+        g_srt_walk_faulted=true;
+        value={};
+    }
+    runtime_fault_recover=nullptr;
+    return value;
+}
+
+void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
+    Arm64Srt::Interpret(program,user_data,flat,[](const void* address,size_t bytes)->u64 {
+        return bytes==sizeof(u64) ? ReadSrtValue<u64>(address) : ReadSrtValue<u32>(address);
+    });
+}
+
+} // namespace Shader
+
+#endif
+
+namespace {
+
 using namespace Shader;
 
 struct PassInfo {
@@ -320,6 +476,30 @@ static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
     UNREACHABLE_MSG("Instruction not supported");
 }
 
+static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+    case IR::Opcode::ReadConst:
+    case IR::Opcode::ReadConstBuffer:
+    case IR::Opcode::IAdd32:
+    case IR::Opcode::ISub32:
+    case IR::Opcode::IMul32:
+    case IR::Opcode::ShiftLeftLogical32:
+    case IR::Opcode::ShiftRightLogical32:
+    case IR::Opcode::BitwiseAnd32:
+    case IR::Opcode::BitwiseOr32:
+    case IR::Opcode::BitwiseXor32:
+    case IR::Opcode::BitwiseNot32:
+    case IR::Opcode::UMin32:
+    case IR::Opcode::UMax32:
+    case IR::Opcode::BitFieldUExtract:
+        return true;
+    default:
+        return false;
+    }
+}
+
+#ifdef ARCH_X86_64
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw);
 
@@ -588,28 +768,6 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
-static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
-    switch (inst->GetOpcode()) {
-    case IR::Opcode::GetUserData:
-    case IR::Opcode::ReadConst:
-    case IR::Opcode::ReadConstBuffer:
-    case IR::Opcode::IAdd32:
-    case IR::Opcode::ISub32:
-    case IR::Opcode::IMul32:
-    case IR::Opcode::ShiftLeftLogical32:
-    case IR::Opcode::ShiftRightLogical32:
-    case IR::Opcode::BitwiseAnd32:
-    case IR::Opcode::BitwiseOr32:
-    case IR::Opcode::BitwiseXor32:
-    case IR::Opcode::BitwiseNot32:
-    case IR::Opcode::UMin32:
-    case IR::Opcode::UMax32:
-    case IR::Opcode::BitFieldUExtract:
-        return true;
-    default:
-        return false;
-    }
-}
 
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw) {
@@ -772,6 +930,130 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }
+
+#else
+
+using SrtProgram = std::vector<u32>;
+
+#define ABORT_ON_FAILURE(expr)                                                                     \
+    if (!(expr)) {                                                                                 \
+        return false;                                                                              \
+    }
+
+static bool ComputeOffset(SrtProgram& p, PassInfo& pass_info, const IR::Value& off_dw);
+
+static bool EmitOperand(SrtProgram& p, PassInfo& pass_info, const IR::Value& value) {
+    if (value.IsImmediate()) {
+        p.insert(p.end(), {OpImm, value.U32()});
+        return true;
+    }
+    return ComputeOffset(p, pass_info, value);
+}
+
+static bool EmitComputeOffsetOp(SrtProgram& p, PassInfo& pass_info, IR::Inst* inst,
+                                SrtOp op, size_t args) {
+    ASSERT(!inst->AreAllArgsImmediates());
+    for (size_t i = 0; i < args; ++i) {
+        ABORT_ON_FAILURE(EmitOperand(p, pass_info, inst->Arg(i)));
+    }
+    p.push_back(op);
+    return true;
+}
+
+static bool ComputeOffset(SrtProgram& p, PassInfo& pass_info, const IR::Value& off_dw) {
+    auto inst = off_dw.Inst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        p.insert(p.end(), {OpUserData, static_cast<u32>(inst->Arg(0).ScalarReg())});
+        return true;
+    case IR::Opcode::ReadConst:
+    case IR::Opcode::ReadConstBuffer:
+        if (u16 offset = GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)); offset != 0) {
+            p.insert(p.end(), {OpFlat, offset});
+            return true;
+        }
+        return false;
+    case IR::Opcode::IAdd32: return EmitComputeOffsetOp(p, pass_info, inst, OpAdd, 2);
+    case IR::Opcode::ISub32: return EmitComputeOffsetOp(p, pass_info, inst, OpSub, 2);
+    case IR::Opcode::IMul32: return EmitComputeOffsetOp(p, pass_info, inst, OpMul, 2);
+    case IR::Opcode::ShiftLeftLogical32: return EmitComputeOffsetOp(p, pass_info, inst, OpShl, 2);
+    case IR::Opcode::ShiftRightLogical32: return EmitComputeOffsetOp(p, pass_info, inst, OpShr, 2);
+    case IR::Opcode::BitwiseAnd32: return EmitComputeOffsetOp(p, pass_info, inst, OpAnd, 2);
+    case IR::Opcode::BitwiseOr32: return EmitComputeOffsetOp(p, pass_info, inst, OpOr, 2);
+    case IR::Opcode::BitwiseXor32: return EmitComputeOffsetOp(p, pass_info, inst, OpXor, 2);
+    case IR::Opcode::BitwiseNot32: return EmitComputeOffsetOp(p, pass_info, inst, OpNot, 1);
+    case IR::Opcode::UMin32: return EmitComputeOffsetOp(p, pass_info, inst, OpUMin, 2);
+    case IR::Opcode::UMax32: return EmitComputeOffsetOp(p, pass_info, inst, OpUMax, 2);
+    case IR::Opcode::BitFieldUExtract:
+        return EmitComputeOffsetOp(p, pass_info, inst, OpBitFieldUExtract, 3);
+    default:
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                  magic_enum::enum_name(inst->GetOpcode()));
+        return false;
+    }
+}
+
+static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
+                         SrtProgram& p) {
+    if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
+        subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
+            subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
+        return;
+    }
+    if (off_dw.IsImmediate()) {
+        p.insert(p.end(), {OpPushImm, off_dw.U32()});
+    } else {
+        SrtProgram offset;
+        if (!ComputeOffset(offset, pass_info, off_dw)) {
+            LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+            return;
+        }
+        p.insert(p.end(), offset.begin(), offset.end());
+        p.push_back(OpPushDyn);
+    }
+    auto* use_list = pass_info.GetUsesAsPointer(subtree);
+    ASSERT(use_list);
+    for (auto [src_off_dw, use] : *use_list) {
+        if (src_off_dw.IsImmediate()) {
+            p.insert(p.end(), {OpCopyImm, src_off_dw.U32(), pass_info.dst_off_dw});
+        } else {
+            SrtProgram offset;
+            if (!ComputeOffset(offset, pass_info, src_off_dw)) {
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                continue;
+            }
+            p.insert(p.end(), offset.begin(), offset.end());
+            p.insert(p.end(), {OpCopyDyn, pass_info.dst_off_dw});
+        }
+        SetFlatbufOffset(use, pass_info.dst_off_dw++);
+    }
+    for (const auto [src_off_dw, use] : *use_list) {
+        if (pass_info.GetUsesAsPointer(use)) {
+            VisitPointer(src_off_dw, use, pass_info, p);
+        }
+    }
+    p.push_back(OpPop);
+}
+
+static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+    if (pass_info.srt_roots.empty()) {
+        return;
+    }
+    SrtProgram program{SrtMagic};
+    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
+    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
+    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, program);
+    }
+    program.push_back(OpEnd);
+    const size_t size = program.size() * sizeof(u32);
+    info.srt_info.walker_func = RegisterWalkerCode(reinterpret_cast<const u8*>(program.data()), size);
+    ASSERT_MSG(info.srt_info.walker_func, "Invalid generated ARM SRT program");
+    info.srt_info.walker_func_size = size;
+    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+}
+
+#endif
 
 static bool IsReadConstSource(const IR::Value base) {
     auto* inst = base.TryInst();
@@ -971,23 +1253,3 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 }
 
 } // namespace Shader::Optimization
-
-#else
-
-namespace Shader {
-
-PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-    UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
-}
-
-namespace Optimization {
-
-void FlattenExtendedUserdataPass(IR::Program& program) {
-    UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
-}
-
-} // namespace Optimization
-
-} // namespace Shader
-
-#endif

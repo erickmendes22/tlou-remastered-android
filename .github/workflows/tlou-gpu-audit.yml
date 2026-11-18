@@ -1,0 +1,29 @@
+name: TLOU GPU Android portability audit
+
+on:
+  push:
+    branches: [android-bionic-stage1]
+    paths:
+      - 'gow3_pc/gpu/**'
+      - '.github/workflows/tlou-gpu-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report architecture- and SDL-specific code remaining in TLOU renderer
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== Architecture-specific includes (review Android guards) ==='
+          git grep -n -E '#include [<"](x86intrin|immintrin|emmintrin|xmmintrin|smmintrin|SDL3/)' -- gow3_pc/gpu || true
+          echo '=== Native x86 builtins and assembly ==='
+          git grep -n -E '(__builtin_ia32_|__rdtsc|_mm_|_mm256_|asm[[:space:]]*\(|__asm__|ARCH_SET_GS)' -- 'gow3_pc/gpu/**/*.cpp' 'gow3_pc/gpu/**/*.h' || true
+          echo '=== Android-unsafe runtime calls ==='
+          git grep -n -E '(SDL_Get|SDL_Init|SDL_Set|SDL_Poll|SDL_Open|SDL_Gamepad|SDL_AudioStream)' -- 'gow3_pc/gpu/shim/*.cpp' || true

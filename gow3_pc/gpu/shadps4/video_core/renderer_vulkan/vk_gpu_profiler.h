@@ -69,6 +69,7 @@ private:
     Scheduler& scheduler;
     vk::UniqueQueryPool pool;
     double period_ns = 1.0;
+    u64 timestamp_mask = ~u64{0};
     u32 slice = 0;
     std::array<std::vector<u64>, NumSlices> keys; ///< label of each timestamp but the last
     std::array<u32, NumSlices> used{};

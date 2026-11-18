@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <atomic>
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -67,7 +68,16 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
-        LOG_WARNING(Render_Recompiler, "First instruction is not s_mov_b32 vcc_hi, #imm");
+        // TLOU valid shaders commonly omit this optional header. Thousands of
+        // identical warnings serialized compiler workers on the logger mutex.
+        // Keep first examples and periodic totals; translation/error handling is unchanged.
+        static std::atomic<u32> missing_header{0};
+        const u32 count = missing_header.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 4 || (count & 1023) == 0) {
+            LOG_WARNING(Render_Recompiler,
+                        "Shader {:#x} starts with {:#x}, without s_mov_b32 vcc_hi header "
+                        "({} occurrences; repeated warnings limited)", info.pgm_hash, code[0], count);
+        }
     }
 
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

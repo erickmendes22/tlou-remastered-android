@@ -1,3 +1,4 @@
+#ifndef __ANDROID__
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -127,3 +128,5 @@ _sceFiberSwitchEntry:
     call _sceFiberForceQuit
     ret
 )");
+
+#endif // !__ANDROID__ (original TLOU x86-64 fiber implementation)

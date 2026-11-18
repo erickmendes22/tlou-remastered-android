@@ -99,6 +99,7 @@ public:
     // gow3: switch from compiler-owned snapshots to live stage data on publication.
     void PublishStages(std::span<const Shader::Info*, MaxShaderStages> infos) {
         std::ranges::copy(infos, stages.begin());
+        RefreshTextureHelperEligibility();
     }
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {

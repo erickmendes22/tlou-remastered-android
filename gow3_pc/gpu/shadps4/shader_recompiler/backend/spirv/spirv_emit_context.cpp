@@ -5,6 +5,7 @@
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/backend/spirv/tlou_split_compute.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/microinstruction.h"
@@ -297,11 +298,20 @@ void EmitContext::DefineAmdPerVertexAttribs() {
 
 void EmitContext::DefineWorkgroupIndex() {
     const Id workgroup_id_val{OpLoad(U32[3], workgroup_id)};
-    const Id workgroup_x{OpCompositeExtract(U32[1], workgroup_id_val, 0)};
+    const Id physical_x{OpCompositeExtract(U32[1], workgroup_id_val, 0)};
+    const auto& cs = runtime_info.hw.cs;
+    const bool split64 = info.sw_stage == SwStage::Compute &&
+        TlouComputeSplit::Use(info.pgm_hash, cs.workgroup_size, cs.shared_memory_size,
+            info.uses_group_quad || info.uses_group_shuffle || info.uses_group_ballot ||
+            static_cast<u32>(info.shared_types) != 0);
+    const Id workgroup_x = split64 ? OpShiftRightLogical(U32[1], physical_x, ConstU32(4u))
+                                    : physical_x;
     const Id workgroup_y{OpCompositeExtract(U32[1], workgroup_id_val, 1)};
     const Id workgroup_z{OpCompositeExtract(U32[1], workgroup_id_val, 2)};
     const Id num_workgroups{OpLoad(U32[3], num_workgroups_id)};
-    const Id num_workgroups_x{OpCompositeExtract(U32[1], num_workgroups, 0)};
+    const Id physical_count_x{OpCompositeExtract(U32[1], num_workgroups, 0)};
+    const Id num_workgroups_x = split64 ? OpShiftRightLogical(U32[1], physical_count_x, ConstU32(4u))
+                                        : physical_count_x;
     const Id num_workgroups_y{OpCompositeExtract(U32[1], num_workgroups, 1)};
     workgroup_index_id =
         OpIAdd(U32[1], OpIAdd(U32[1], workgroup_x, OpIMul(U32[1], workgroup_y, num_workgroups_x)),
@@ -485,9 +495,15 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::Compute:
+    case SwStage::Compute: {
+        const bool split64 = TlouComputeSplit::Use(info.pgm_hash,
+            runtime_info.hw.cs.workgroup_size, runtime_info.hw.cs.shared_memory_size,
+            info.uses_group_quad || info.uses_group_shuffle || info.uses_group_ballot ||
+            static_cast<u32>(info.shared_types) != 0);
         if (info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
-            info.loads.GetAny(IR::Attribute::WorkgroupId)) {
+            info.loads.GetAny(IR::Attribute::WorkgroupId) ||
+            (split64 && (info.loads.GetAny(IR::Attribute::LocalInvocationId) ||
+                         info.loads.Get(IR::Attribute::LocalInvocationIndex)))) {
             workgroup_id =
                 DefineVariable(U32[3], spv::BuiltIn::WorkgroupId, spv::StorageClass::Input);
         }
@@ -504,6 +520,7 @@ void EmitContext::DefineInputs() {
                                                     spv::StorageClass::Input);
         }
         break;
+    }
     case SwStage::Geometry: {
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
         const auto gl_per_vertex =

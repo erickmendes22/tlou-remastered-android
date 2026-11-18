@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "common/arch.h"
 #include "gow3_copy.h"
 #include "gow3_threads.h"
 
@@ -156,7 +157,7 @@ public:
         if (BlockingWaits()) {
             for (unsigned spin = 0;
                  spin < WaitSpins && job->done.load(std::memory_order_acquire) < count; ++spin) {
-                __builtin_ia32_pause();
+                COMMON_CPU_RELAX();
             }
             // The thread finishing the last index takes the mutex before it signals done_cv:
             // either this check (under the mutex) sees its count, or this thread is already
@@ -298,7 +299,7 @@ private:
             }
             // Only running copies left: spin on the flag a little before sleeping.
             for (unsigned spin = 0; spin < WaitSpins && !IdleNow(); ++spin) {
-                __builtin_ia32_pause();
+                COMMON_CPU_RELAX();
             }
             if (IdleNow()) {
                 return;

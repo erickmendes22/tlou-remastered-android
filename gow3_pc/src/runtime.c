@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "guest_cpu.h"
 #include "gpu/gow3gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,9 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <pthread.h>
+#ifdef __ANDROID__
+#include <sys/mman.h>
+#endif
 
 typedef struct {
     union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
@@ -44,7 +48,11 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
     }
     unsigned char **block=&tls_blocks[index[0]];
     if (!*block) {
+#ifdef __ANDROID__
+        *block=runtime_low_map(tls_modules[index[0]].memsz,PROT_READ|PROT_WRITE);
+#else
         *block=calloc(1,tls_modules[index[0]].memsz);
+#endif
         if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
         memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
     }
@@ -122,8 +130,11 @@ void runtime_finalize(void *dso) {
         if (!i) { pthread_mutex_unlock(&handler_lock); return; }
         ExitHandler handler = handlers[i-1]; handlers[i-1].active = 0;
         pthread_mutex_unlock(&handler_lock);
-        if (handler.with_arg) handler.callback.with_arg(handler.argument);
-        else handler.callback.plain();
+        /* C++ destructors are guest x86-64 functions, not native ARM64. */
+        if (handler.with_arg)
+            guest_cpu_call((uintptr_t)handler.callback.with_arg,1,
+                           (const uint64_t[]){(uint64_t)(uintptr_t)handler.argument});
+        else guest_cpu_call((uintptr_t)handler.callback.plain,0,NULL);
     }
 }
 static ABI void guest_finalize(void *dso) { runtime_finalize(dso); }

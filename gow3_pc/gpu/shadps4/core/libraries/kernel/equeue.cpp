@@ -6,7 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <immintrin.h>
+#include "common/arch.h"
 #include "common/shared_handle_table.h"
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
@@ -279,7 +279,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
             if ((polls & 63) == 63 && std::chrono::steady_clock::now() >= until) {
                 break;
             }
-            _mm_pause();
+            COMMON_CPU_RELAX();
         }
         if (micros && spin != spin_us) {
             // The watch counts against a timed wait (GOW3_IRQ_WAIT_SPIN; GOW3_EQUEUE_SPIN_US keeps

@@ -1,3 +1,4 @@
+#ifndef __ANDROID__
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -575,3 +576,5 @@ extern "C" uintptr_t runtime_fiber_resolve(const char *name) {
     if (!std::strcmp(name,"0dy4JtMUcMQ#libSceFiber")) return (uintptr_t)sceFiberGetThreadFramePointerAddress;
     return 0;
 }
+
+#endif // !__ANDROID__ (original TLOU x86-64 fiber implementation)

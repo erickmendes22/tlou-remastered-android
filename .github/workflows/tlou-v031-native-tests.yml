@@ -1,0 +1,67 @@
+name: TLOU v0.31 optional paths and save archives
+on:
+  push:
+    branches: [android-bionic-stage1]
+    paths: ['android-launcher/**', 'gow3_pc/**', '.github/workflows/tlou-v031-native-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Save archive round-trip and running-game exclusion
+        run: bash android/bionic/test_fps.sh
+      - name: Memory walks ON/OFF and sanitizers
+        run: |
+          set -euo pipefail
+          mkdir -p out/v031
+          cc -std=c11 -O2 -Wall -Wextra -Werror -pthread gow3_pc/tests/test_memory_walk_cost.c -o out/v031/memory-walk
+          out/v031/memory-walk --correctness-only
+          cc -std=c11 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer gow3_pc/tests/test_memory_walk_cost.c -o out/v031/memory-walk-san
+          out/v031/memory-walk-san --correctness-only
+      - name: Ring bindings, host-copy helper and draw counters
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/v031
+          for test in ring_binding_cursor tlou_host_copy_batch draw_pipe_busy_sample; do
+            g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread -I gow3_pc/gpu/shim -I gow3_pc/gpu/shadps4 "gow3_pc/tests/test_${test}.cpp" -o "out/v031/$test"
+            "out/v031/$test" --correctness-only
+          done
+      - name: Actual RecordChunk order and completion between CPU cores
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/v031
+          python3 gow3_pc/tests/extract_host_copy_chunks.py out/v031 > out/v031/chunks-extract.txt 2>&1
+          g++ -std=c++20 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -iquote out/v031 -I gow3_pc/gpu/shim -I gow3_pc/gpu/shadps4 gow3_pc/tests/test_tlou_threaded_record_chunk.cpp -o out/v031/chunks-san > out/v031/chunks-compile.txt 2>&1
+          out/v031/chunks-san --correctness-only > out/v031/chunks-run.txt 2>&1
+      - name: Preserve copy diagnostics even when the job fails
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: v031-copy-diagnostics-${{ matrix.runner }}
+          path: out/v031/*.txt
+          if-no-files-found: warn
+      - name: Shader specialization prerequisites
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: sudo apt-get update -qq && sudo apt-get install -qq -y libboost-dev libspdlog-dev libfmt-dev libvulkan-dev
+      - name: Exact compute memo against production specialization
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/v031
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-variable -Wno-reorder -Wno-class-memaccess -pthread -I gow3_pc/tests/native-shim -I gow3_pc/gpu/shadps4 -I gow3_pc/gpu/shim gow3_pc/tests/test_tlou_compute_perm_memo.cpp -o out/v031/memo
+          out/v031/memo --correctness-only

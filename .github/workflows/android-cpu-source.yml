@@ -1,0 +1,73 @@
+name: TLOU ARM64 Bionic loader syntax
+
+on:
+  push:
+    paths: ['gow3_pc/src/**', 'gow3_pc/gpu/shim/**', 'gow3_pc/gpu/shadps4/video_core/renderer_vulkan/**', '.github/workflows/android-cpu-source.yml']
+  pull_request:
+    paths: ['gow3_pc/src/**', '.github/workflows/android-cpu-source.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  fex-loader-bionic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools ndk;29.0.14206865'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Compile real TLOU Android launcher (Java)
+        run: gradle -p android-launcher :app:compileReleaseJavaWithJavac :app:lintVitalRelease --no-daemon --max-workers=2
+      - name: Compile native TLOU code against ARM64 Bionic NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          CC="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+          "$CC" --version | head -n 1
+          # FFmpeg-backed modules need target FFmpeg headers built separately by
+          # android/bionic/build_deps.sh; do not silently use host headers.
+          for source in gow3_pc/src/probe.c gow3_pc/src/runtime*.c gow3_pc/src/vulkan_smoke.c; do
+            case "$source" in *runtime_mp3.c|*runtime_videodec.c)
+              echo "Requires Bionic FFmpeg cross-build: $source (not syntax-checked here)"
+              continue ;;
+            esac
+            echo "::group::$source"
+            "$CC" -std=c11 -O2 -Wall -Wextra -Werror -DGOW3_NO_SDL=1 -pthread -fsyntax-only -I gow3_pc -I gow3_pc/src "$source"
+            echo '::endgroup::'
+          done
+      - name: Validate Android window, Vulkan loader and AHB presentation source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CXX="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++"
+          for source in gow3_pc/gpu/shim/window_android.cpp gow3_pc/gpu/shim/vk_driver_loader.cpp gow3_pc/gpu/shim/gow3_present_client.cpp; do
+            echo "::group::$source"
+            "$CXX" -std=c++23 -Wall -Wextra -Werror -fsyntax-only \
+              -I gow3_pc/gpu/shim -I gow3_pc/gpu/shadps4 \
+              -I gow3_pc/tools/android/present "$source"
+            echo '::endgroup::'
+          done
+      - name: Compile TLOU libSceFiber Bionic FEX continuation HLE
+        shell: bash
+        run: |
+          set -euo pipefail
+          CXX="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++"
+          "$CXX" -std=c++23 -Wall -Wextra -Werror -Wno-ignored-attributes -fsyntax-only \
+            -I gow3_pc/gpu/shim -I gow3_pc/gpu -I gow3_pc/src \
+            gow3_pc/gpu/shim/gow3_fiber_bionic.cpp
+      - name: Check TLOU loader FEX dispatch points
+        run: |
+          grep -Fq 'guest_cpu_call((uintptr_t)(image+entry)' gow3_pc/src/probe.c
+          grep -Fq 'guest_cpu_host_function((void *)resolved)' gow3_pc/src/probe.c
+          grep -Fq 'guest_cpu_call((uintptr_t)t->entry' gow3_pc/src/runtime_thread.c

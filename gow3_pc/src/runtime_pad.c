@@ -1,3 +1,4 @@
+#ifndef __ANDROID__
 /* libScePad on SDL3 gamepads, with keyboard and mouse. SDL events are pumped by the window
  * thread (gpu/shim/window.cpp); here state is only sampled.
  *
@@ -920,3 +921,5 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }
+
+#endif // !__ANDROID__ (TLOU-specific desktop keyboard/mouse/pad)
